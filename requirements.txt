@@ -1,1 +1,2 @@
-duckdb==1.5.6
+# Test helpers only (fixture runner / compare). The scored image is a static binary.
+polars

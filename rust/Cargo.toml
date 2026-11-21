@@ -9,11 +9,16 @@ name = "shopsess"
 path = "src/main.rs"
 
 [dependencies]
-rustc-hash = "2"
+hashbrown = "0.15"
+memchr = "2"
+memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
+parquet = { version = "54", default-features = false }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+strip = true

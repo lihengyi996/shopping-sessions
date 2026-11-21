@@ -6,9 +6,9 @@ The score is container run time. A table that is almost right scores nothing, so
 
 ## What the pipeline does
 
-`rust/src/main.rs` does the scan, the cleaning, the sessions, and both aggregates. `pipeline/pipeline.py` writes the Parquet tables. A single DuckDB pass over the raw CSVs was too slow for the hidden run.
+`rust/src/main.rs` (and its modules) does the full job: parallel mmap CSV scan, cleaning, union-find, sessions, attribution, and direct Parquet writes. The scored image is a static musl binary in a `FROM scratch` container—no Python or DuckDB at run time.
 
-1. Read every CSV by splitting on `\n` only. A `\r` stays inside the field, quoted fields are unwrapped, and a malformed line is dropped.
+1. Memory-map every CSV and scan chunks across `NCPU` threads. Lines split only on `\n`; a `\r` stays inside the field; quoted fields unwrap; malformed lines drop.
 2. Deduplicate events on `event_id` before validation, keeping the earliest ingest time. Deduplicate clicks on `click_id`.
 3. Keep an event only when its timestamp is inside the window, its type is `view`, `cart`, or `purchase`, and it was not ingested more than 24 hours late. Purchases also need a whole-cent price from 1 to 10,000,000.
 4. Link user IDs into one person. The person's name is the byte-wise smallest ID in the component.
@@ -18,20 +18,21 @@ The score is container run time. A table that is almost right scores nothing, so
 
 ## Checks
 
-The 36 edge-case fixtures under `fixtures/` pass, and the public 1 million-event dev set matches the published answer exactly (117,038 shopper-day rows and 27,400 campaign-day rows) in about 5 seconds on a laptop.
+The 36 edge-case fixtures under `fixtures/` pass, and the public 1 million-event dev set matches the published answer exactly (117,038 shopper-day rows and 27,400 campaign-day rows). On a typical cloud VM the 1M run is about 0.13 s wall time (was ~1.5 s for the prior Rust+DuckDB path on the same box).
 
 ```sh
-pip install duckdb==1.5.6 polars
-python scripts/run_fixtures.py fixtures -- python pipeline/pipeline.py
+cargo build --release --manifest-path rust/Cargo.toml
+pip install polars
+python scripts/run_fixtures.py fixtures -- rust/target/release/shopsess
 ```
 
 The public 1 million-event dev set is produced with the track's Rust generator (`generator.zip` on the track page, Rust 1.85 or newer) and checked against `dev-answer.zip`:
 
 ```sh
-cargo build --release
-target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+cargo build --release --manifest-path rust/Cargo.toml
+generate --seed 1 --events 1000000 --clicks 250000 --output dev
 # unzip dev-answer.zip so dev-answer/user_daily.csv and campaign_daily.csv are present
-DATA_DIR=dev OUTPUT_DIR=out python pipeline/pipeline.py
+DATA_DIR=dev OUTPUT_DIR=out rust/target/release/shopsess
 python scripts/compare.py out dev-answer
 ```
 
@@ -49,8 +50,8 @@ make check-dev
 
 | Path | Role |
 | --- | --- |
-| `pipeline/pipeline.py` | The pipeline |
-| `Dockerfile`, `run.sh` | `linux/amd64` image. `CMD` takes no arguments |
+| `rust/` | The pipeline (static binary `shopsess`) |
+| `Dockerfile`, `run.sh` | `linux/amd64` scratch image. `CMD` takes no arguments |
 | `rules.md` | The spec. It wins if a comment here disagrees with it |
 | `fixtures/` | 36 edge cases and their expected tables |
 | `scripts/` | Fixture runner and the exact output diff |

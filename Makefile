@@ -18,6 +18,11 @@ build:
 fixtures: build
 	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
 
+## Local (no Docker): build the binary and run fixtures against it
+fixtures-local:
+	cargo build --release --manifest-path rust/Cargo.toml --locked
+	python3 scripts/run_fixtures.py $(FIXTURES) -- rust/target/release/shopsess
+
 ## Make the 1M-event dev set with the published generator (needs `generate` on PATH)
 dev:
 	generate --seed 1 --events 1000000 --clicks 250000 --output $(DEV)

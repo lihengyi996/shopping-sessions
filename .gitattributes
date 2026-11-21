@@ -1,0 +1,2 @@
+# Preserve exact bytes in fixtures (some cases embed CR as field data).
+fixtures/** -text

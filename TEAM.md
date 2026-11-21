@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: Rust, DuckDB writes the Parquet
+Engine: Rust (static musl binary; direct Parquet)
