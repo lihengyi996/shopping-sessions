@@ -84,16 +84,6 @@ impl Id {
     }
 
     #[inline]
-    pub const fn from_word(word: u64) -> Self {
-        Id(word)
-    }
-
-    #[inline]
-    pub fn word(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
     pub fn ord(self, other: Self) -> Ordering {
         if (self.0 | other.0) & INTERNED == 0 {
             self.0.cmp(&other.0)

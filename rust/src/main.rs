@@ -2,7 +2,7 @@
 //!
 //! Ideas adapted from fast public track entries (parallel mmap scans, hash
 //! shards for dedup, packed IDs, dense campaign grids, direct Parquet, a
-//! static Cascade Lake image): implemented here without copying their sources.
+//! glibc image): implemented here without copying their sources.
 
 mod csv;
 mod ids;
@@ -33,20 +33,17 @@ const PERSON_SHARDS: usize = 1 << PERSON_BITS;
 
 const PRICE_BITS: u32 = 24;
 const PRICE_MASK: u32 = (1 << PRICE_BITS) - 1;
-/// High bit of `sale` marks a row that passed validation.
-const OK_BIT: u32 = 1 << 31;
-const SALE_MASK: u32 = OK_BIT - 1;
 
 #[derive(Clone, Copy)]
 struct RawEvent {
     event: Id,
+    ingest: i64,
     user: Id,
-    /// Milliseconds from window_start. Bad ingest uses i32::MAX.
-    ingest: i32,
-    /// Milliseconds from window_start; only meaningful when ok.
+    /// Milliseconds from window_start; only meaningful when `ok`.
     ts: i32,
-    /// Price in low 24 bits, category above that, OK_BIT set when the row is kept.
+    /// 0 = not a purchase / invalid purchase marker handled via ok flag.
     sale: u32,
+    ok: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -90,11 +87,8 @@ struct Campaigns {
 }
 
 struct People {
-    /// Open-addressed rename table. Zero key means empty. Only non-identity
-    /// renames are stored so most lookups exit on the first empty probe.
-    keys: Vec<u64>,
-    vals: Vec<u64>,
-    mask: usize,
+    /// Linked user Id -> person name Id (only non-identity entries).
+    rename: HashMap<Id, Id>,
 }
 
 impl People {
@@ -126,65 +120,21 @@ impl People {
                 best[root] = i;
             }
         }
-        let mut n = 0usize;
-        for i in 0..keys.len() as u32 {
-            let root = find(&mut parent, i) as usize;
-            if keys[best[root] as usize] != keys[i as usize] {
-                n += 1;
-            }
-        }
-        if n == 0 {
-            return People { keys: Vec::new(), vals: Vec::new(), mask: 0 };
-        }
-        let cap = (n.next_power_of_two() * 2).max(16);
-        let mut table_keys = vec![0u64; cap];
-        let mut table_vals = vec![0u64; cap];
-        let mask = cap - 1;
+        let mut rename = HashMap::new();
         for i in 0..keys.len() as u32 {
             let root = find(&mut parent, i) as usize;
             let name = keys[best[root] as usize];
-            let id = keys[i as usize];
-            if name == id {
-                continue;
+            if name != keys[i as usize] {
+                rename.insert(keys[i as usize], name);
             }
-            let word = id.word();
-            let mut slot = mix(word) as usize & mask;
-            while table_keys[slot] != 0 {
-                slot = (slot + 1) & mask;
-            }
-            table_keys[slot] = word;
-            table_vals[slot] = name.word();
         }
-        People { keys: table_keys, vals: table_vals, mask }
+        People { rename }
     }
 
     #[inline]
     fn name_of(&self, id: Id) -> Id {
-        if self.mask == 0 {
-            return id;
-        }
-        let word = id.word();
-        if word == 0 {
-            return id;
-        }
-        let mut slot = mix(word) as usize & self.mask;
-        loop {
-            let key = self.keys[slot];
-            if key == 0 {
-                return id;
-            }
-            if key == word {
-                return Id::from_word(self.vals[slot]);
-            }
-            slot = (slot + 1) & self.mask;
-        }
+        self.rename.get(&id).copied().unwrap_or(id)
     }
-}
-
-#[inline]
-fn mix(n: u64) -> u64 {
-    let x = n.wrapping_mul(0x517c_c1b7_2722_0a95);
-    x ^ (x >> 32)
 }
 
 fn find(parent: &mut [u32], mut i: u32) -> u32 {
@@ -360,7 +310,6 @@ fn parse_events(
         ncpu,
         Vec::new,
         |out: &mut Vec<RawEvent>, data, start, end| {
-            out.reserve((end - start) / 64);
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 7];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() {
@@ -378,7 +327,7 @@ fn parse_events(
 
 fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Option<RawEvent> {
     let event = Id::of(fields[0]);
-    let ingest_abs = ts::parse(fields[3]).unwrap_or(i64::MAX);
+    let ingest = ts::parse(fields[3]).unwrap_or(i64::MAX);
     let user_raw = fields[1];
     let product_raw = fields[5];
     let (typed, purchase) = match fields[4] {
@@ -389,7 +338,7 @@ fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Op
     let mut ok = !user_raw.is_empty() && !product_raw.is_empty() && typed;
     let ts = match ts::parse(fields[2]) {
         Some(t) if t >= window.start && t < window.end => {
-            ok &= ingest_abs.saturating_sub(t) <= DAY_MS;
+            ok &= ingest.saturating_sub(t) <= DAY_MS;
             (t - window.start) as i32
         }
         _ => {
@@ -407,20 +356,13 @@ fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Op
             None => ok = false,
         }
     }
-    if ok {
-        sale |= OK_BIT;
-    }
-    let ingest = if ingest_abs == i64::MAX {
-        i32::MAX
-    } else {
-        (ingest_abs - window.start).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-    };
     Some(RawEvent {
         event,
         ingest,
-        user: if ok { Id::of(user_raw) } else { Id::from_word(0) },
+        user: if ok { Id::of(user_raw) } else { Id::of(b"") },
         ts,
         sale,
+        ok,
     })
 }
 
@@ -491,45 +433,39 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
             .map(|_| {
                 scope.spawn(|| {
                     let mut open: Vec<Vec<Event>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-                    // Index into `flat` instead of storing a full RawEvent in the map.
-                    let mut kept: HashMap<Id, (i32, u32)> = HashMap::new();
-                    let mut flat: Vec<RawEvent> = Vec::new();
+                    let mut kept: HashMap<Id, RawEvent> = HashMap::new();
                     loop {
                         let s = next.fetch_add(1, AtomicOrdering::Relaxed);
                         if s >= columns.len() {
                             break;
                         }
                         let pieces = std::mem::take(&mut *columns[s].lock().unwrap());
-                        flat.clear();
                         let total: usize = pieces.iter().map(|p| p.len()).sum();
-                        flat.reserve(total);
-                        for piece in pieces {
-                            flat.extend(piece);
-                        }
                         kept.clear();
-                        kept.reserve(flat.len());
-                        for (i, raw) in flat.iter().enumerate() {
-                            match kept.entry(raw.event) {
-                                Entry::Vacant(v) => {
-                                    v.insert((raw.ingest, i as u32));
-                                }
-                                Entry::Occupied(mut o) => {
-                                    if raw.ingest < o.get().0 {
-                                        o.insert((raw.ingest, i as u32));
+                        kept.reserve(total);
+                        for piece in pieces {
+                            for raw in piece {
+                                match kept.entry(raw.event) {
+                                    Entry::Vacant(v) => {
+                                        v.insert(raw);
+                                    }
+                                    Entry::Occupied(mut o) => {
+                                        if raw.ingest < o.get().ingest {
+                                            o.insert(raw);
+                                        }
                                     }
                                 }
                             }
                         }
-                        for &(_, i) in kept.values() {
-                            let raw = &flat[i as usize];
-                            if raw.sale & OK_BIT == 0 {
+                        for raw in kept.values() {
+                            if !raw.ok {
                                 continue;
                             }
                             let person = people.name_of(raw.user);
                             open[person.shard(PERSON_BITS)].push(Event {
                                 person,
                                 ts: raw.ts,
-                                sale: raw.sale & SALE_MASK,
+                                sale: raw.sale,
                             });
                         }
                     }
@@ -554,7 +490,6 @@ fn parse_click_shards(
         ncpu,
         Vec::new,
         |out: &mut Vec<Click>, data, start, end| {
-            out.reserve((end - start) / 48);
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 4];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() || fields[1].is_empty() {
