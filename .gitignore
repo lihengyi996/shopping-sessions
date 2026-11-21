@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated data and local run output. The scorer mounts /data at run time.
+dev/
+out/
+dev-answer/
+*.zip
+
+# Local scratch and the official generator checkout
+shopping-scratch/
+duckdb_tmp/
+_generator_src/
