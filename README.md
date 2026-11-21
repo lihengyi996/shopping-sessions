@@ -6,7 +6,7 @@ The score is container run time. A table that is almost right scores nothing, so
 
 ## What the pipeline does
 
-`rust/src/main.rs` (and its modules) does the full job: parallel mmap CSV scan, cleaning, union-find, sessions, attribution, and direct Parquet writes. The scored image is a static musl binary in a `FROM scratch` container—no Python or DuckDB at run time.
+`rust/src/main.rs` (and its modules) does the full job: parallel mmap CSV scan, cleaning, union-find, sessions, attribution, and direct Parquet writes. The scored image is a glibc binary on Debian bookworm—no Python or DuckDB at run time.
 
 1. Memory-map every CSV and scan chunks across `NCPU` threads. Lines split only on `\n`; a `\r` stays inside the field; quoted fields unwrap; malformed lines drop.
 2. Deduplicate events on `event_id` before validation, keeping the earliest ingest time. Deduplicate clicks on `click_id`.
@@ -18,7 +18,7 @@ The score is container run time. A table that is almost right scores nothing, so
 
 ## Checks
 
-The 36 edge-case fixtures under `fixtures/` pass, and the public 1 million-event dev set matches the published answer exactly (117,038 shopper-day rows and 27,400 campaign-day rows). On a typical cloud VM the 1M run is about 0.13 s wall time (was ~1.5 s for the prior Rust+DuckDB path on the same box).
+The 36 edge-case fixtures under `fixtures/` pass, and the public 1 million-event dev set matches the published answer exactly (117,038 shopper-day rows and 27,400 campaign-day rows). On this machine that 1M run is about 0.18 s, and a 4M run is about 0.6 s.
 
 ```sh
 cargo build --release --manifest-path rust/Cargo.toml

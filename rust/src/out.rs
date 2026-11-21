@@ -40,7 +40,8 @@ pub struct UserRow {
     pub sessions: i64,
     pub events: i64,
     pub revenue: i64,
-    pub top: Option<Vec<u8>>,
+    /// Category index into the product category table. None when the day has no purchase.
+    pub top: Option<u16>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -66,7 +67,7 @@ fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>, Fail>
     Ok(SerializedFileWriter::new(File::create(path)?, schema, props)?)
 }
 
-pub fn write_user_daily(path: &Path, rows: &[UserRow]) -> Result<(), Fail> {
+pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -> Result<(), Fail> {
     let mut file = writer(path, USER_SCHEMA)?;
     let mut group = file.next_row_group()?;
     let ids: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.person.bytes())).collect();
@@ -84,8 +85,8 @@ pub fn write_user_daily(path: &Path, rows: &[UserRow]) -> Result<(), Fail> {
     let levels: Vec<i16> = rows.iter().map(|r| i16::from(r.top.is_some())).collect();
     let tops: Vec<ByteArray> = rows
         .iter()
-        .filter_map(|r| r.top.as_ref())
-        .map(|c| ByteArray::from(c.clone()))
+        .filter_map(|r| r.top)
+        .map(|c| ByteArray::from(categories[c as usize].clone()))
         .collect();
     write_bytes(&mut group, &tops, Some(&levels))?;
     group.close()?;

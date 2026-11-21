@@ -1,6 +1,6 @@
 //! CSV dialect from rules.md: `\n` ends a line, quotes only wrap whole fields.
 
-use memchr::memchr;
+use memchr::{memchr, memchr2};
 
 #[inline]
 pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
@@ -30,27 +30,19 @@ fn field<'a>(line: &'a [u8], i: usize) -> Option<(&'a [u8], usize)> {
         return Some((b"", i));
     }
     if line[i] == b'"' {
-        let mut j = i + 1;
-        while j < line.len() && line[j] != b'"' {
-            j += 1;
-        }
-        if j >= line.len() {
-            return None;
-        }
+        let rel = memchr(b'"', &line[i + 1..])?;
+        let j = i + 1 + rel;
         let after = j + 1;
         if after < line.len() && line[after] != b',' {
             return None;
         }
         return Some((&line[i + 1..j], after));
     }
-    let mut j = i;
-    while j < line.len() && line[j] != b',' {
-        if line[j] == b'"' {
-            return None;
-        }
-        j += 1;
+    match memchr2(b',', b'"', &line[i..]) {
+        Some(rel) if line[i + rel] == b',' => Some((&line[i..i + rel], i + rel)),
+        Some(_) => None,
+        None => Some((&line[i..], line.len())),
     }
-    Some((&line[i..j], j))
 }
 
 /// Walk body lines of a CSV buffer (skip the header). `end` is exclusive; the

@@ -46,6 +46,18 @@ struct Pool {
     bytes: Vec<Vec<u8>>,
 }
 
+#[cold]
+#[inline(never)]
+fn intern(raw: &[u8]) -> Id {
+    let mut p = pool().lock().unwrap();
+    let n = p.bytes.len() as u32;
+    let idx = *p.by_bytes.entry(raw.to_vec()).or_insert(n);
+    if idx == n {
+        p.bytes.push(raw.to_vec());
+    }
+    Id(INTERNED | u64::from(idx))
+}
+
 fn pool() -> &'static Mutex<Pool> {
     static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -57,15 +69,10 @@ impl Id {
     #[inline]
     pub fn of(raw: &[u8]) -> Self {
         if let Some(packed) = pack(raw) {
-            return Id(packed);
+            Id(packed)
+        } else {
+            intern(raw)
         }
-        let mut p = pool().lock().unwrap();
-        let n = p.bytes.len() as u32;
-        let idx = *p.by_bytes.entry(raw.to_vec()).or_insert(n);
-        if idx == n {
-            p.bytes.push(raw.to_vec());
-        }
-        Id(INTERNED | u64::from(idx))
     }
 
     pub fn bytes(self) -> Vec<u8> {

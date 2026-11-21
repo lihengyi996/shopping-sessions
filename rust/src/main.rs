@@ -2,7 +2,7 @@
 //!
 //! Ideas adapted from fast public track entries (parallel mmap scans, hash
 //! shards for dedup, packed IDs, dense campaign grids, direct Parquet, a
-//! static musl image): implemented here without copying their sources.
+//! glibc image): implemented here without copying their sources.
 
 mod csv;
 mod ids;
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
@@ -27,8 +28,6 @@ use ts::{day_of, DAY_MS, GAP_MS, WEEK_MS};
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc;
 
-const EVENT_BITS: u32 = 10;
-const EVENT_SHARDS: usize = 1 << EVENT_BITS;
 const PERSON_BITS: u32 = 8;
 const PERSON_SHARDS: usize = 1 << PERSON_BITS;
 
@@ -68,8 +67,10 @@ struct Window {
 }
 
 struct Products {
-    /// product Id -> category index
+    /// product Id -> category index, for ids that are not `p` + digits
     map: HashMap<Id, u16>,
+    /// `p{n}` -> category. `u16::MAX` means that number is not in the catalog.
+    by_num: Vec<u16>,
     categories: Vec<Vec<u8>>,
     /// byte-rank of each category for tie breaks
     rank: Vec<u16>,
@@ -78,6 +79,8 @@ struct Products {
 
 struct Campaigns {
     map: HashMap<Id, u16>,
+    /// `c_{n}` -> campaign index. `u16::MAX` means that number is not in the catalog.
+    by_num: Vec<u16>,
     ids: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
     organic: u16,
@@ -169,6 +172,7 @@ fn threads() -> usize {
 }
 
 fn run() -> Result<(), String> {
+    let t0 = Instant::now();
     let data = env_path("DATA_DIR", "/data");
     let out = env_path("OUTPUT_DIR", "/output");
     let ncpu = threads();
@@ -184,25 +188,33 @@ fn run() -> Result<(), String> {
     let link_files = scan::csv_files(&data.join("links")).map_err(|e| e.to_string())?;
     let event_files = scan::csv_files(&data.join("events")).map_err(|e| e.to_string())?;
     let click_files = scan::csv_files(&data.join("clicks")).map_err(|e| e.to_string())?;
+    let t_setup = t0.elapsed();
 
-    let (people, event_shards) = std::thread::scope(|scope| -> Result<(People, Vec<Vec<RawEvent>>), String> {
+    let (people, event_shards, click_shards) = std::thread::scope(|scope| -> Result<(People, Vec<Vec<RawEvent>>, Vec<Vec<Click>>), String> {
         let links = scope.spawn(|| collect_links(&link_files, ncpu));
         let events = scope.spawn(|| parse_events(&event_files, ncpu, &window, &products));
+        let clicks = scope.spawn(|| parse_click_shards(&click_files, ncpu, &window, &campaigns));
         let pairs = links.join().unwrap()?;
         let people = People::build(pairs);
         let shards = events.join().unwrap()?;
-        Ok((people, shards))
+        let clicks = clicks.join().unwrap()?;
+        Ok((people, shards, clicks))
     })?;
+    let t_scan = t0.elapsed();
 
-    let event_buckets = dedup_events(event_shards, ncpu, &people);
-    let click_buckets = parse_clicks(&click_files, ncpu, &window, &campaigns, &people)?;
+    let (event_buckets, click_buckets) = std::thread::scope(|scope| {
+        let events = scope.spawn(|| dedup_events(event_shards, ncpu, &people));
+        let clicks = scope.spawn(|| dedup_clicks(click_shards, ncpu, &people));
+        (events.join().unwrap(), clicks.join().unwrap())
+    });
+    let t_dedup = t0.elapsed();
 
     let base_day = day_of(window.start);
     let days = (day_of(window.end - 1) - base_day + 1) as usize;
     let n_campaigns = campaigns.ids.len();
 
     let mut click_parts = click_buckets.into_iter();
-    let work: Vec<Mutex<Option<(Vec<Vec<Event>>, Vec<Vec<Click>>)>>> = event_buckets
+    let work: Vec<Mutex<Option<(Vec<Event>, Vec<Click>)>>> = event_buckets
         .into_iter()
         .map(|ev| Mutex::new(Some((ev, click_parts.next().unwrap_or_default()))))
         .collect();
@@ -224,11 +236,11 @@ fn run() -> Result<(), String> {
                         let Some((events, clicks)) = work[b].lock().unwrap().take() else {
                             continue;
                         };
-                        run_person_shard(&events, &clicks, days, base_day, window.start, products, &mut cells, &mut rows);
+                        run_person_shard(events, clicks, days, base_day, window.start, products, &mut cells, &mut rows);
                     }
                     if tid == 0 || !rows.is_empty() {
                         let path = user_dir.join(format!("part-{tid:03}.parquet"));
-                        out::write_user_daily(&path, &rows).map_err(|e| e.to_string())?;
+                        out::write_user_daily(&path, &rows, &products.categories).map_err(|e| e.to_string())?;
                     }
                     Ok((cells, rows))
                 })
@@ -258,6 +270,13 @@ fn run() -> Result<(), String> {
         campaigns.organic as usize,
     )
     .map_err(|e| e.to_string())?;
+    eprintln!(
+        "shopsess setup {:?} scan {:?} dedup {:?} total {:?}",
+        t_setup,
+        t_scan.saturating_sub(t_setup),
+        t_dedup.saturating_sub(t_scan),
+        t0.elapsed()
+    );
     Ok(())
 }
 
@@ -284,12 +303,13 @@ fn parse_events(
     window: &Window,
     products: &Products,
 ) -> Result<Vec<Vec<RawEvent>>, String> {
-    let per = 64usize;
-    let states = scan::for_chunks(
+    // One contiguous vector per thread. Sharding here scatters every push
+    // across a thousand allocations and stops the scan from scaling.
+    scan::for_chunks(
         files,
         ncpu,
-        || (0..EVENT_SHARDS).map(|_| Vec::with_capacity(per)).collect::<Vec<_>>(),
-        |shards: &mut Vec<Vec<RawEvent>>, data, start, end| {
+        Vec::new,
+        |out: &mut Vec<RawEvent>, data, start, end| {
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 7];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() {
@@ -298,22 +318,11 @@ fn parse_events(
                 let Some(raw) = decode_event(&fields, window, products) else {
                     return;
                 };
-                let s = raw.event.shard(EVENT_BITS);
-                shards[s].push(raw);
+                out.push(raw);
             });
         },
     )
-    .map_err(|e| e.to_string())?;
-
-    let mut merged: Vec<Vec<RawEvent>> = (0..EVENT_SHARDS).map(|_| Vec::new()).collect();
-    for state in states {
-        for (s, part) in state.into_iter().enumerate() {
-            if !part.is_empty() {
-                merged[s].extend(part);
-            }
-        }
-    }
-    Ok(merged)
+    .map_err(|e| e.to_string())
 }
 
 fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Option<RawEvent> {
@@ -341,8 +350,7 @@ fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Op
     if purchase && ok {
         match parse_price(fields[6]) {
             Some(price) => {
-                let pid = Id::of(product_raw);
-                let cat = products.map.get(&pid).copied().unwrap_or(products.unknown);
+                let cat = product_cat(products, product_raw);
                 sale = price | (u32::from(cat) << PRICE_BITS);
             }
             None => ok = false,
@@ -356,6 +364,41 @@ fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Op
         sale,
         ok,
     })
+}
+
+fn product_cat(products: &Products, raw: &[u8]) -> u16 {
+    if let Some(n) = prefixed_num(raw, b"p") {
+        if let Some(&cat) = products.by_num.get(n as usize) {
+            if cat != u16::MAX {
+                return cat;
+            }
+        }
+        return products.unknown;
+    }
+    products.map.get(&Id::of(raw)).copied().unwrap_or(products.unknown)
+}
+
+fn campaign_id(campaigns: &Campaigns, raw: &[u8]) -> Option<u16> {
+    if let Some(n) = prefixed_num(raw, b"c_") {
+        return campaigns.by_num.get(n as usize).copied().filter(|id| *id != u16::MAX);
+    }
+    let id = campaigns.map.get(&Id::of(raw)).copied()?;
+    (id != campaigns.organic).then_some(id)
+}
+
+fn prefixed_num(raw: &[u8], prefix: &[u8]) -> Option<u32> {
+    let rest = raw.strip_prefix(prefix)?;
+    if rest.is_empty() || (rest.len() > 1 && rest[0] == b'0') {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for &b in rest {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    Some(n)
 }
 
 fn parse_price(raw: &[u8]) -> Option<u32> {
@@ -375,113 +418,94 @@ fn parse_price(raw: &[u8]) -> Option<u32> {
     (1..=10_000_000).contains(&n).then_some(n as u32)
 }
 
-fn dedup_events(shards: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<Vec<Vec<Event>>> {
-    let shard_lock: Vec<Mutex<Vec<RawEvent>>> = shards.into_iter().map(Mutex::new).collect();
+fn hash_bits(ncpu: usize) -> u32 {
+    ncpu.max(1).next_power_of_two().trailing_zeros().min(5)
+}
+
+fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<Vec<Event>> {
+    let bits = hash_bits(ncpu);
+    let columns = partition(parts, bits, |raw| raw.event.shard(bits));
     let next = AtomicUsize::new(0);
-    let outs: Vec<Vec<Vec<Vec<Event>>>> = std::thread::scope(|scope| {
+    let outs: Vec<Vec<Vec<Event>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..ncpu.max(1))
             .map(|_| {
                 scope.spawn(|| {
                     let mut open: Vec<Vec<Event>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-                    let mut full: Vec<Vec<Vec<Event>>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-                    let mut kept: HashMap<Id, (i64, usize)> = HashMap::new();
+                    let mut kept: HashMap<Id, RawEvent> = HashMap::new();
                     loop {
                         let s = next.fetch_add(1, AtomicOrdering::Relaxed);
-                        if s >= shard_lock.len() {
+                        if s >= columns.len() {
                             break;
                         }
-                        let part = std::mem::take(&mut *shard_lock[s].lock().unwrap());
+                        let pieces = std::mem::take(&mut *columns[s].lock().unwrap());
+                        let total: usize = pieces.iter().map(|p| p.len()).sum();
                         kept.clear();
-                        kept.reserve(part.len());
-                        for (i, raw) in part.iter().enumerate() {
-                            match kept.entry(raw.event) {
-                                Entry::Vacant(v) => {
-                                    v.insert((raw.ingest, i));
-                                }
-                                Entry::Occupied(mut o) => {
-                                    if raw.ingest < o.get().0 {
-                                        o.insert((raw.ingest, i));
+                        kept.reserve(total);
+                        for piece in pieces {
+                            for raw in piece {
+                                match kept.entry(raw.event) {
+                                    Entry::Vacant(v) => {
+                                        v.insert(raw);
+                                    }
+                                    Entry::Occupied(mut o) => {
+                                        if raw.ingest < o.get().ingest {
+                                            o.insert(raw);
+                                        }
                                     }
                                 }
                             }
                         }
-                        for &(_, i) in kept.values() {
-                            let raw = &part[i];
+                        for raw in kept.values() {
                             if !raw.ok {
                                 continue;
                             }
                             let person = people.name_of(raw.user);
-                            let b = person.shard(PERSON_BITS);
-                            let cur = &mut open[b];
-                            if cur.len() == cur.capacity() && !cur.is_empty() {
-                                let filled = std::mem::replace(cur, Vec::with_capacity(256));
-                                full[b].push(filled);
-                            }
-                            cur.push(Event { person, ts: raw.ts, sale: raw.sale });
+                            open[person.shard(PERSON_BITS)].push(Event {
+                                person,
+                                ts: raw.ts,
+                                sale: raw.sale,
+                            });
                         }
                     }
-                    for (b, cur) in open.into_iter().enumerate() {
-                        if !cur.is_empty() {
-                            full[b].push(cur);
-                        }
-                    }
-                    full
+                    open
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut buckets: Vec<Vec<Vec<Event>>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-    for state in outs {
-        for (b, parts) in state.into_iter().enumerate() {
-            buckets[b].extend(parts);
-        }
-    }
-    buckets
+    merge_buckets(outs)
 }
 
-fn parse_clicks(
+fn parse_click_shards(
     files: &[PathBuf],
     ncpu: usize,
     window: &Window,
     campaigns: &Campaigns,
-    people: &People,
-) -> Result<Vec<Vec<Vec<Click>>>, String> {
+) -> Result<Vec<Vec<Click>>, String> {
     let click_lo = window.start - WEEK_MS;
-    let states = scan::for_chunks(
+    scan::for_chunks(
         files,
         ncpu,
-        || (0..PERSON_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(),
-        |shards: &mut Vec<Vec<Click>>, data, start, end| {
-            let mut seen: HashMap<Id, ()> = HashMap::new();
+        Vec::new,
+        |out: &mut Vec<Click>, data, start, end| {
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 4];
-                if !csv::split(line, &mut fields) || fields[0].is_empty() {
+                if !csv::split(line, &mut fields) || fields[0].is_empty() || fields[1].is_empty() {
                     return;
                 }
-                let cid = Id::of(fields[0]);
-                if seen.insert(cid, ()).is_some() {
-                    return;
-                }
-                if fields[1].is_empty() {
-                    return;
-                }
-                let Some(&campaign) = campaigns.map.get(&Id::of(fields[2])) else {
+                let Some(campaign) = campaign_id(campaigns, fields[2]) else {
                     return;
                 };
-                if campaign == campaigns.organic {
-                    return;
-                }
                 let Some(ts_abs) = ts::parse(fields[3]) else {
                     return;
                 };
                 if ts_abs < click_lo || ts_abs >= window.end {
                     return;
                 }
-                let person = people.name_of(Id::of(fields[1]));
-                let b = person.shard(PERSON_BITS);
-                shards[b].push(Click {
-                    person,
+                let cid = Id::of(fields[0]);
+                // `person` holds the raw user until dedup resolves the linked name.
+                out.push(Click {
+                    person: Id::of(fields[1]),
                     ts: (ts_abs - window.start) as i32,
                     campaign,
                     id: cid,
@@ -489,33 +513,92 @@ fn parse_clicks(
             });
         },
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+}
 
-    // Click dedup is per click_id globally. Thread-local seen only catches
-    // duplicates inside one worker's chunks; finish with a global pass per
-    // person shard (click_ids rarely collide across people, but must be exact).
-    let mut buckets: Vec<Vec<Vec<Click>>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-    let mut global: HashMap<Id, Click> = HashMap::new();
-    for state in states {
-        for part in state {
-            for click in part {
-                global.entry(click.id).or_insert(click);
+fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec<Click>> {
+    let bits = hash_bits(ncpu);
+    let columns = partition(parts, bits, |click| click.id.shard(bits));
+    let next = AtomicUsize::new(0);
+    let outs: Vec<Vec<Vec<Click>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..ncpu.max(1))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut open: Vec<Vec<Click>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
+                    let mut kept: HashMap<Id, Click> = HashMap::new();
+                    loop {
+                        let s = next.fetch_add(1, AtomicOrdering::Relaxed);
+                        if s >= columns.len() {
+                            break;
+                        }
+                        let pieces = std::mem::take(&mut *columns[s].lock().unwrap());
+                        let total: usize = pieces.iter().map(|p| p.len()).sum();
+                        kept.clear();
+                        kept.reserve(total);
+                        for piece in pieces {
+                            for click in piece {
+                                // Copies of one click_id are identical, so any survivor is fine.
+                                kept.entry(click.id).or_insert(click);
+                            }
+                        }
+                        for mut click in kept.values().copied() {
+                            click.person = people.name_of(click.person);
+                            open[click.person.shard(PERSON_BITS)].push(click);
+                        }
+                    }
+                    open
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    merge_buckets(outs)
+}
+
+fn partition<T: Send>(parts: Vec<Vec<T>>, bits: u32, shard: impl Fn(&T) -> usize + Sync) -> Vec<Mutex<Vec<Vec<T>>>> {
+    let shards = 1usize << bits;
+    let columns: Vec<Mutex<Vec<Vec<T>>>> = (0..shards).map(|_| Mutex::new(Vec::new())).collect();
+    let split: Vec<Vec<Vec<T>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in parts {
+            handles.push(scope.spawn(|| {
+                let mut buckets: Vec<Vec<T>> = (0..shards).map(|_| Vec::new()).collect();
+                for item in part {
+                    buckets[shard(&item)].push(item);
+                }
+                buckets
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for buckets in split {
+        for (s, bucket) in buckets.into_iter().enumerate() {
+            if !bucket.is_empty() {
+                columns[s].lock().unwrap().push(bucket);
             }
         }
     }
-    for click in global.into_values() {
-        let b = click.person.shard(PERSON_BITS);
-        if buckets[b].is_empty() {
-            buckets[b].push(Vec::new());
+    columns
+}
+
+fn merge_buckets<T>(outs: Vec<Vec<Vec<T>>>) -> Vec<Vec<T>> {
+    let n = outs.first().map(|o| o.len()).unwrap_or(0);
+    let mut buckets: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+    for state in outs {
+        for (b, part) in state.into_iter().enumerate() {
+            if buckets[b].is_empty() {
+                buckets[b] = part;
+            } else {
+                buckets[b].extend(part);
+            }
         }
-        buckets[b][0].push(click);
     }
-    Ok(buckets)
+    buckets
 }
 
 fn run_person_shard(
-    event_parts: &[Vec<Event>],
-    click_parts: &[Vec<Click>],
+    mut events: Vec<Event>,
+    mut clicks: Vec<Click>,
     days: usize,
     base_day: i32,
     origin: i64,
@@ -523,23 +606,27 @@ fn run_person_shard(
     cells: &mut [CampCell],
     rows: &mut Vec<UserRow>,
 ) {
-    let mut by_person: HashMap<Id, (Vec<Event>, Vec<Click>)> = HashMap::new();
-    for part in event_parts {
-        for &e in part {
-            by_person.entry(e.person).or_default().0.push(e);
+    events.sort_unstable_by(|a, b| a.person.ord(b.person).then(a.ts.cmp(&b.ts)));
+    clicks.sort_unstable_by(|a, b| a.person.ord(b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.id.ord(b.id)));
+    let mut sessions = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    while i < events.len() {
+        let person = events[i].person;
+        let mut i2 = i + 1;
+        while i2 < events.len() && events[i2].person == person {
+            i2 += 1;
         }
-    }
-    for part in click_parts {
-        for &c in part {
-            if let Some(slot) = by_person.get_mut(&c.person) {
-                slot.1.push(c);
-            }
+        while j < clicks.len() && clicks[j].person.ord(person) == Ordering::Less {
+            j += 1;
         }
-    }
-    for (person, (mut events, mut clicks)) in by_person {
-        events.sort_unstable_by_key(|e| e.ts);
-        clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.ord(b.id)));
-        sessionize(person, &events, &clicks, days, base_day, origin, products, cells, rows);
+        let mut j2 = j;
+        while j2 < clicks.len() && clicks[j2].person == person {
+            j2 += 1;
+        }
+        sessionize(person, &events[i..i2], &clicks[j..j2], days, base_day, origin, products, cells, rows, &mut sessions);
+        i = i2;
+        j = j2;
     }
 }
 
@@ -553,24 +640,32 @@ fn sessionize(
     products: &Products,
     cells: &mut [CampCell],
     rows: &mut Vec<UserRow>,
+    sessions: &mut Vec<(i32, usize)>,
 ) {
     if events.is_empty() {
         return;
     }
-    let mut day_sessions = vec![0i64; days];
-    let mut day_events = vec![0i64; days];
-    let mut day_revenue = vec![0i64; days];
-    let mut day_cats: Vec<Vec<(u16, i64)>> = (0..days).map(|_| Vec::new()).collect();
-    let mut used = Vec::new();
-    let mut sessions: Vec<(i32, usize)> = Vec::new();
+    // The generator window is 14 days and the catalog has about 20 categories.
+    // Stack slots avoid a heap allocation per shopper, which dominated the 20M run.
+    const MAX_D: usize = 32;
+    const MAX_C: usize = 32;
+    let nc = products.categories.len();
+    if days > MAX_D || nc > MAX_C {
+        sessionize_heap(person, events, clicks, days, base_day, origin, products, cells, rows, sessions);
+        return;
+    }
+    let mut day_sessions = [0i64; MAX_D];
+    let mut day_events = [0i64; MAX_D];
+    let mut day_revenue = [0i64; MAX_D];
+    let mut cat_rev = [0i64; MAX_D * MAX_C];
+    let mut used = [false; MAX_D];
+    sessions.clear();
 
     let mut k = 0;
     while k < events.len() {
         let start = events[k].ts;
         let day = (day_of(origin + i64::from(start)) - base_day) as usize;
-        if day_sessions[day] == 0 {
-            used.push(day);
-        }
+        used[day] = true;
         let mut prev = start;
         let mut m = k;
         let mut revenue = 0i64;
@@ -583,12 +678,9 @@ fn sessionize(
             let sale = events[m].sale;
             if sale != 0 {
                 let price = i64::from(sale & PRICE_MASK);
-                let cat = (sale >> PRICE_BITS) as u16;
+                let cat = (sale >> PRICE_BITS) as usize;
                 revenue += price;
-                match day_cats[day].iter_mut().find(|(c, _)| *c == cat) {
-                    Some(slot) => slot.1 += price,
-                    None => day_cats[day].push((cat, price)),
-                }
+                cat_rev[day * MAX_C + cat] += price;
             }
             m += 1;
         }
@@ -609,19 +701,23 @@ fn sessionize(
     }
 
     if !clicks.is_empty() {
-        assist(clicks, &sessions, days, cells);
+        assist(clicks, sessions, days, cells);
     }
 
-    for day in used {
+    for day in 0..days {
+        if !used[day] {
+            continue;
+        }
         let mut top = None;
         let mut best = 0i64;
-        for &(cat, sum) in &day_cats[day] {
+        for cat in 0..nc {
+            let sum = cat_rev[day * MAX_C + cat];
+            if sum == 0 {
+                continue;
+            }
             let better = match top {
                 None => true,
-                Some(cur) => {
-                    sum > best
-                        || (sum == best && products.rank[cat as usize] < products.rank[cur as usize])
-                }
+                Some(cur) => sum > best || (sum == best && products.rank[cat] < products.rank[cur]),
             };
             if better {
                 top = Some(cat);
@@ -634,7 +730,97 @@ fn sessionize(
             sessions: day_sessions[day],
             events: day_events[day],
             revenue: day_revenue[day],
-            top: top.map(|c| products.categories[c as usize].clone()),
+            top: top.map(|c| c as u16),
+        });
+    }
+}
+
+fn sessionize_heap(
+    person: Id,
+    events: &[Event],
+    clicks: &[Click],
+    days: usize,
+    base_day: i32,
+    origin: i64,
+    products: &Products,
+    cells: &mut [CampCell],
+    rows: &mut Vec<UserRow>,
+    sessions: &mut Vec<(i32, usize)>,
+) {
+    let nc = products.categories.len();
+    let mut day_sessions = vec![0i64; days];
+    let mut day_events = vec![0i64; days];
+    let mut day_revenue = vec![0i64; days];
+    let mut cat_rev = vec![0i64; days * nc];
+    let mut used = vec![false; days];
+    sessions.clear();
+    let mut k = 0;
+    while k < events.len() {
+        let start = events[k].ts;
+        let day = (day_of(origin + i64::from(start)) - base_day) as usize;
+        used[day] = true;
+        let mut prev = start;
+        let mut m = k;
+        let mut revenue = 0i64;
+        while m < events.len() {
+            let ts = events[m].ts;
+            if i64::from(ts) - i64::from(prev) > GAP_MS {
+                break;
+            }
+            prev = ts;
+            let sale = events[m].sale;
+            if sale != 0 {
+                let price = i64::from(sale & PRICE_MASK);
+                let cat = (sale >> PRICE_BITS) as usize;
+                revenue += price;
+                cat_rev[day * nc + cat] += price;
+            }
+            m += 1;
+        }
+        let n = (m - k) as i64;
+        day_sessions[day] += 1;
+        day_events[day] += n;
+        day_revenue[day] += revenue;
+        let credited = credit_campaign(clicks, start);
+        let cell = &mut cells[credited as usize * days + day];
+        cell.sessions += 1;
+        if revenue > 0 {
+            cell.purchasing += 1;
+            cell.revenue += revenue;
+        }
+        sessions.push((start, day));
+        k = m;
+    }
+    if !clicks.is_empty() {
+        assist(clicks, sessions, days, cells);
+    }
+    for day in 0..days {
+        if !used[day] {
+            continue;
+        }
+        let mut top = None;
+        let mut best = 0i64;
+        for cat in 0..nc {
+            let sum = cat_rev[day * nc + cat];
+            if sum == 0 {
+                continue;
+            }
+            let better = match top {
+                None => true,
+                Some(cur) => sum > best || (sum == best && products.rank[cat] < products.rank[cur]),
+            };
+            if better {
+                top = Some(cat);
+                best = sum;
+            }
+        }
+        rows.push(UserRow {
+            person,
+            day: base_day + day as i32,
+            sessions: day_sessions[day],
+            events: day_events[day],
+            revenue: day_revenue[day],
+            top: top.map(|c| c as u16),
         });
     }
 }
@@ -719,6 +905,7 @@ fn read_products(data: &Path) -> Result<Products, String> {
     let path = data.join("products.csv");
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let mut map = HashMap::new();
+    let mut by_num: Vec<u16> = Vec::new();
     let mut categories: Vec<Vec<u8>> = Vec::new();
     let mut cat_index: HashMap<Vec<u8>, u16> = HashMap::new();
     let ensure = |name: &[u8], categories: &mut Vec<Vec<u8>>, cat_index: &mut HashMap<Vec<u8>, u16>| -> u16 {
@@ -736,7 +923,14 @@ fn read_products(data: &Path) -> Result<Products, String> {
             return;
         }
         let cat = ensure(fields[1], &mut categories, &mut cat_index);
-        map.insert(Id::of(fields[0]), cat);
+        if let Some(n) = prefixed_num(fields[0], b"p") {
+            if by_num.len() <= n as usize {
+                by_num.resize(n as usize + 1, u16::MAX);
+            }
+            by_num[n as usize] = cat;
+        } else {
+            map.insert(Id::of(fields[0]), cat);
+        }
     });
     let unknown = ensure(b"unknown", &mut categories, &mut cat_index);
     let mut order: Vec<u16> = (0..categories.len() as u16).collect();
@@ -745,7 +939,7 @@ fn read_products(data: &Path) -> Result<Products, String> {
     for (r, &c) in order.iter().enumerate() {
         rank[c as usize] = r as u16;
     }
-    Ok(Products { map, categories, rank, unknown })
+    Ok(Products { map, by_num, categories, rank, unknown })
 }
 
 fn read_campaigns(data: &Path) -> Result<Campaigns, String> {
@@ -755,6 +949,7 @@ fn read_campaigns(data: &Path) -> Result<Campaigns, String> {
     let mut ids = vec![b"organic".to_vec()];
     let mut channels = vec![b"organic".to_vec()];
     let mut map = HashMap::new();
+    let mut by_num: Vec<u16> = Vec::new();
     map.insert(Id::of(b"organic"), 0);
     csv::for_body_lines(&bytes, 0, bytes.len(), |line| {
         let mut fields = [b"" as &[u8]; 2];
@@ -765,9 +960,16 @@ fn read_campaigns(data: &Path) -> Result<Campaigns, String> {
             return;
         }
         let idx = ids.len() as u16;
-        map.insert(Id::of(fields[0]), idx);
+        if let Some(n) = prefixed_num(fields[0], b"c_") {
+            if by_num.len() <= n as usize {
+                by_num.resize(n as usize + 1, u16::MAX);
+            }
+            by_num[n as usize] = idx;
+        } else {
+            map.insert(Id::of(fields[0]), idx);
+        }
         ids.push(fields[0].to_vec());
         channels.push(fields[1].to_vec());
     });
-    Ok(Campaigns { map, ids, channels, organic: 0 })
+    Ok(Campaigns { map, by_num, ids, channels, organic: 0 })
 }
