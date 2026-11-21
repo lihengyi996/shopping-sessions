@@ -418,8 +418,10 @@ fn parse_price(raw: &[u8]) -> Option<u32> {
     (1..=10_000_000).contains(&n).then_some(n as u32)
 }
 
-fn hash_bits(ncpu: usize) -> u32 {
-    ncpu.max(1).next_power_of_two().trailing_zeros().min(5)
+fn hash_bits(_ncpu: usize) -> u32 {
+    // 64 shards: each table stays small enough that probing beats one big map.
+    // 8 shards was about twice as slow; 256 started to lose to the scatter.
+    6
 }
 
 fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<Vec<Event>> {
@@ -562,7 +564,8 @@ fn partition<T: Send>(parts: Vec<Vec<T>>, bits: u32, shard: impl Fn(&T) -> usize
         let mut handles = Vec::new();
         for part in parts {
             handles.push(scope.spawn(|| {
-                let mut buckets: Vec<Vec<T>> = (0..shards).map(|_| Vec::new()).collect();
+                let guess = part.len() / shards + 1;
+                let mut buckets: Vec<Vec<T>> = (0..shards).map(|_| Vec::with_capacity(guess)).collect();
                 for item in part {
                     buckets[shard(&item)].push(item);
                 }
@@ -842,10 +845,28 @@ fn credit_campaign(clicks: &[Click], start: i32) -> u16 {
 }
 
 fn assist(clicks: &[Click], sessions: &[(i32, usize)], days: usize, cells: &mut [CampCell]) {
+    if clicks.is_empty() || sessions.is_empty() {
+        return;
+    }
+    if clicks.len() <= 64 && days <= 32 {
+        let mut tmp = [(0u16, 0i32); 64];
+        for (i, click) in clicks.iter().enumerate() {
+            tmp[i] = (click.campaign, click.ts);
+        }
+        let n = clicks.len();
+        tmp[..n].sort_unstable();
+        let mut day_lo = [0usize; 33];
+        assist_sorted(&tmp[..n], sessions, days, cells, &mut day_lo);
+    } else {
+        let mut by_camp: Vec<(u16, i32)> = clicks.iter().map(|c| (c.campaign, c.ts)).collect();
+        by_camp.sort_unstable();
+        let mut day_lo = vec![0usize; days + 1];
+        assist_sorted(&by_camp, sessions, days, cells, &mut day_lo);
+    }
+}
+
+fn assist_sorted(by_camp: &[(u16, i32)], sessions: &[(i32, usize)], days: usize, cells: &mut [CampCell], day_lo: &mut [usize]) {
     let week = WEEK_MS as i32;
-    let mut by_camp: Vec<(u16, i32)> = clicks.iter().map(|c| (c.campaign, c.ts)).collect();
-    by_camp.sort_unstable();
-    let mut day_lo = vec![0usize; days + 1];
     for d in 0..=days {
         day_lo[d] = sessions.partition_point(|s| s.1 < d);
     }

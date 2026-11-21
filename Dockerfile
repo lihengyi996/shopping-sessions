@@ -3,7 +3,8 @@ FROM rust:1.85-slim-bookworm AS build
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+# Cascade Lake is the scorer CPU and includes AVX-512. x86-64-v3 stops at AVX2.
+ENV RUSTFLAGS="-C target-cpu=cascadelake"
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
