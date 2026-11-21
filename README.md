@@ -1,12 +1,12 @@
 # Shopping Sessions
 
-A DuckDB pipeline for the [Builders buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) shopping track. An online shop logs page views, add-to-carts, purchases, and ad clicks as dirty CSV. One shopper can show up under many user IDs. The job is to clean the logs, join those IDs, build sessions, credit each session to the ad click that brought the shopper in, and write two exact daily Parquet tables.
+A Rust pipeline for the [Builders buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) shopping track. An online shop logs page views, add-to-carts, purchases, and ad clicks as dirty CSV. One shopper can show up under many user IDs. The job is to clean the logs, join those IDs, build sessions, credit each session to the ad click that brought the shopper in, and write two exact daily Parquet tables.
 
 The score is container run time. A table that is almost right scores nothing, so the rules in `rules.md` are followed exactly.
 
 ## What the pipeline does
 
-`pipeline/pipeline.py` runs inside the scorer's container. DuckDB does the scans, joins, session windows, and both daily aggregates.
+`rust/src/main.rs` does the scan, the cleaning, the sessions, and both aggregates. `pipeline/pipeline.py` writes the Parquet tables. A single DuckDB pass over the raw CSVs was too slow for the hidden run.
 
 1. Read every CSV by splitting on `\n` only. A `\r` stays inside the field, quoted fields are unwrapped, and a malformed line is dropped.
 2. Deduplicate events on `event_id` before validation, keeping the earliest ingest time. Deduplicate clicks on `click_id`.
@@ -18,7 +18,7 @@ The score is container run time. A table that is almost right scores nothing, so
 
 ## Checks
 
-The 36 edge-case fixtures under `fixtures/` pass, and the public 1 million-event dev set matches the published answer exactly (117,038 shopper-day rows and 27,400 campaign-day rows).
+The 36 edge-case fixtures under `fixtures/` pass, and the public 1 million-event dev set matches the published answer exactly (117,038 shopper-day rows and 27,400 campaign-day rows) in about 5 seconds on a laptop.
 
 ```sh
 pip install duckdb==1.5.6 polars

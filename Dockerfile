@@ -1,23 +1,21 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+# Native binary for the hot path. DuckDB only writes the Parquet tables.
+# The scorer builds this on linux/amd64 and runs it as uid 1000.
+FROM rust:1.85-slim-bookworm AS build
+WORKDIR /src
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/src ./src
+RUN cargo build --release
+
 FROM python:3.12-slim-bookworm
-
-# The scorer runs the container as uid 1000; give that uid a name and a home.
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-
+COPY --from=build /src/target/release/shopsess /usr/local/bin/shopsess
 COPY pipeline/ /app/pipeline/
 COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
+RUN chmod +x /app/run.sh /usr/local/bin/shopsess
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
+    PYTHONUNBUFFERED=1 \
+    PIPELINE_BIN=/usr/local/bin/shopsess
 WORKDIR /app
 CMD ["/app/run.sh"]

@@ -1,0 +1,19 @@
+[package]
+name = "shopsess"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "shopsess"
+path = "src/main.rs"
+
+[dependencies]
+rustc-hash = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = false
