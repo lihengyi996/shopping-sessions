@@ -310,6 +310,7 @@ fn parse_events(
         ncpu,
         Vec::new,
         |out: &mut Vec<RawEvent>, data, start, end| {
+            out.reserve((end - start) / 64);
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 7];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() {
@@ -419,9 +420,9 @@ fn parse_price(raw: &[u8]) -> Option<u32> {
 }
 
 fn hash_bits(_ncpu: usize) -> u32 {
-    // 64 shards: each table stays small enough that probing beats one big map.
-    // 8 shards was about twice as slow; 256 started to lose to the scatter.
-    6
+    // 1024 shards keep each open table near L2. 64 was our prior best; 8 was
+    // much slower. Public fast entries also land near this partition count.
+    10
 }
 
 fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<Vec<Event>> {
@@ -490,6 +491,7 @@ fn parse_click_shards(
         ncpu,
         Vec::new,
         |out: &mut Vec<Click>, data, start, end| {
+            out.reserve((end - start) / 48);
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 4];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() || fields[1].is_empty() {
