@@ -1,0 +1,66 @@
+# Cooler Linux A/B than the Windows laptop. This is NOT the GCP grader
+# (no Cascade Lake guarantee), but it is stable enough to gate algorithm changes.
+name: ab-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline commit to beat
+        required: true
+        default: "908fecf1dceffb13f6598e3f7cd11b940349a089"
+      events:
+        description: Event count for the synthetic set
+        required: true
+        default: "4000000"
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      # Safe on GitHub runners; cascadelake can SIGILL on non-Intel hosts.
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install time
+        run: sudo apt-get update && sudo apt-get install -y time
+
+      - name: Fetch and build official generator
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/generator.zip \
+            https://raw.githubusercontent.com/joch44/shopping-sessions/main/generator.zip
+          mkdir -p /tmp/ss-generator
+          unzip -q /tmp/generator.zip -d /tmp/ss-generator-src
+          # zip layouts vary; find the Cargo.toml
+          GEN_ROOT="$(find /tmp/ss-generator-src -name Cargo.toml -print -quit | xargs dirname)"
+          cargo build --release --manifest-path "$GEN_ROOT/Cargo.toml"
+          mkdir -p /tmp/ss-generator/target/release
+          cp "$GEN_ROOT/target/release/generate" /tmp/ss-generator/target/release/generate
+
+      - name: Interleaved A/B
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          EVENTS: ${{ inputs.events }}
+          CLICKS: "1000000"
+          NCPU: "8"
+          PAIRS: "6"
+          GEN_DIR: /tmp/ss-generator
+          DATA_DIR: /tmp/ss-ab-data
+          OUTPUT_DIR: /tmp/ss-ab-out
+        run: |
+          chmod +x scripts/ab_bench.sh
+          scripts/ab_bench.sh | tee ab-bench.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ab-bench-log
+          path: ab-bench.log
