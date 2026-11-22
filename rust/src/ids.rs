@@ -92,6 +92,12 @@ impl Id {
         }
     }
 
+    /// Stable machine key for grouping/sorting when byte order is not required.
+    #[inline]
+    pub fn key(self) -> u64 {
+        self.0
+    }
+
     #[inline]
     pub fn shard(self, bits: u32) -> usize {
         (self.0.wrapping_mul(0x517c_c1b7_2722_0a95) >> (64 - bits)) as usize

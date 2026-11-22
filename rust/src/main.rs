@@ -611,8 +611,15 @@ fn run_person_shard(
     cells: &mut [CampCell],
     rows: &mut Vec<UserRow>,
 ) {
-    events.sort_unstable_by(|a, b| a.person.ord(b.person).then(a.ts.cmp(&b.ts)));
-    clicks.sort_unstable_by(|a, b| a.person.ord(b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.id.ord(b.id)));
+    // Group by Id machine key. Row order does not matter; click_id ties still use byte ord.
+    events.sort_unstable_by(|a, b| a.person.key().cmp(&b.person.key()).then(a.ts.cmp(&b.ts)));
+    clicks.sort_unstable_by(|a, b| {
+        a.person
+            .key()
+            .cmp(&b.person.key())
+            .then(a.ts.cmp(&b.ts))
+            .then_with(|| a.id.ord(b.id))
+    });
     let mut sessions = Vec::new();
     let mut i = 0;
     let mut j = 0;
@@ -622,7 +629,8 @@ fn run_person_shard(
         while i2 < events.len() && events[i2].person == person {
             i2 += 1;
         }
-        while j < clicks.len() && clicks[j].person.ord(person) == Ordering::Less {
+        let pk = person.key();
+        while j < clicks.len() && clicks[j].person.key() < pk {
             j += 1;
         }
         let mut j2 = j;
