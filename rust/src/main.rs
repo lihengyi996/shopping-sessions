@@ -46,16 +46,6 @@ struct RawEvent {
     ok: bool,
 }
 
-/// Dedup map value: key already holds `event`, so do not store it again.
-#[derive(Clone, Copy)]
-struct KeptEvent {
-    ingest: i64,
-    user: Id,
-    ts: i32,
-    sale: u32,
-    ok: bool,
-}
-
 #[derive(Clone, Copy)]
 struct Event {
     person: Id,
@@ -69,14 +59,6 @@ struct Click {
     ts: i32,
     campaign: u16,
     id: Id,
-}
-
-/// Dedup map value for clicks: key already holds `click_id`.
-#[derive(Clone, Copy)]
-struct KeptClick {
-    person: Id,
-    ts: i32,
-    campaign: u16,
 }
 
 struct Window {
@@ -452,7 +434,7 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
             .map(|_| {
                 scope.spawn(|| {
                     let mut open: Vec<Vec<Event>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-                    let mut kept: HashMap<Id, KeptEvent> = HashMap::new();
+                    let mut kept: HashMap<Id, RawEvent> = HashMap::new();
                     loop {
                         let s = next.fetch_add(1, AtomicOrdering::Relaxed);
                         if s >= columns.len() {
@@ -464,20 +446,13 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
                         kept.reserve(total);
                         for piece in pieces {
                             for raw in piece {
-                                let body = KeptEvent {
-                                    ingest: raw.ingest,
-                                    user: raw.user,
-                                    ts: raw.ts,
-                                    sale: raw.sale,
-                                    ok: raw.ok,
-                                };
                                 match kept.entry(raw.event) {
                                     Entry::Vacant(v) => {
-                                        v.insert(body);
+                                        v.insert(raw);
                                     }
                                     Entry::Occupied(mut o) => {
-                                        if body.ingest < o.get().ingest {
-                                            o.insert(body);
+                                        if raw.ingest < o.get().ingest {
+                                            o.insert(raw);
                                         }
                                     }
                                 }
@@ -554,7 +529,7 @@ fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec
             .map(|_| {
                 scope.spawn(|| {
                     let mut open: Vec<Vec<Click>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-                    let mut kept: HashMap<Id, KeptClick> = HashMap::new();
+                    let mut kept: HashMap<Id, Click> = HashMap::new();
                     loop {
                         let s = next.fetch_add(1, AtomicOrdering::Relaxed);
                         if s >= columns.len() {
@@ -567,21 +542,12 @@ fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec
                         for piece in pieces {
                             for click in piece {
                                 // Copies of one click_id are identical, so any survivor is fine.
-                                kept.entry(click.id).or_insert(KeptClick {
-                                    person: click.person,
-                                    ts: click.ts,
-                                    campaign: click.campaign,
-                                });
+                                kept.entry(click.id).or_insert(click);
                             }
                         }
-                        for (id, body) in kept.iter() {
-                            let person = people.name_of(body.person);
-                            open[person.shard(PERSON_BITS)].push(Click {
-                                person,
-                                ts: body.ts,
-                                campaign: body.campaign,
-                                id: *id,
-                            });
+                        for mut click in kept.values().copied() {
+                            click.person = people.name_of(click.person);
+                            open[click.person.shard(PERSON_BITS)].push(click);
                         }
                     }
                     open
