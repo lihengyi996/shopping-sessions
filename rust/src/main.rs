@@ -303,14 +303,20 @@ fn parse_events(
     window: &Window,
     products: &Products,
 ) -> Result<Vec<Vec<RawEvent>>, String> {
-    // One contiguous vector per thread. Sharding here scatters every push
-    // across a thousand allocations and stops the scan from scaling.
-    scan::for_chunks(
+    // Shard during parse (pre-sized buckets) so dedup can skip a full repartition pass.
+    let bits = hash_bits(ncpu);
+    let shards = 1usize << bits;
+    let thread_parts = scan::for_chunks(
         files,
         ncpu,
-        Vec::new,
-        |out: &mut Vec<RawEvent>, data, start, end| {
-            out.reserve((end - start) / 64);
+        || (0..shards).map(|_| Vec::new()).collect::<Vec<Vec<RawEvent>>>(),
+        |out: &mut Vec<Vec<RawEvent>>, data, start, end| {
+            let per = ((end - start) / 64 / shards).saturating_add(1);
+            for bucket in out.iter_mut() {
+                if bucket.capacity() < bucket.len() + per {
+                    bucket.reserve(per);
+                }
+            }
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 7];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() {
@@ -319,11 +325,13 @@ fn parse_events(
                 let Some(raw) = decode_event(&fields, window, products) else {
                     return;
                 };
-                out.push(raw);
+                let s = raw.event.shard(bits);
+                out[s].push(raw);
             });
         },
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(merge_thread_shards(thread_parts, shards))
 }
 
 fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Option<RawEvent> {
@@ -425,9 +433,23 @@ fn hash_bits(_ncpu: usize) -> u32 {
     10
 }
 
+fn merge_thread_shards<T>(thread_parts: Vec<Vec<Vec<T>>>, shards: usize) -> Vec<Vec<T>> {
+    let mut out: Vec<Vec<T>> = (0..shards).map(|_| Vec::new()).collect();
+    for parts in thread_parts {
+        for (s, mut bucket) in parts.into_iter().enumerate() {
+            if out[s].is_empty() {
+                out[s] = bucket;
+            } else {
+                out[s].append(&mut bucket);
+            }
+        }
+    }
+    out
+}
+
 fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<Vec<Event>> {
-    let bits = hash_bits(ncpu);
-    let columns = partition(parts, bits, |raw| raw.event.shard(bits));
+    // `parts` is already one Vec per dedup shard (filled during parse).
+    let columns: Vec<Mutex<Vec<RawEvent>>> = parts.into_iter().map(Mutex::new).collect();
     let next = AtomicUsize::new(0);
     let outs: Vec<Vec<Vec<Event>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..ncpu.max(1))
@@ -440,20 +462,17 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
                         if s >= columns.len() {
                             break;
                         }
-                        let pieces = std::mem::take(&mut *columns[s].lock().unwrap());
-                        let total: usize = pieces.iter().map(|p| p.len()).sum();
+                        let piece = std::mem::take(&mut *columns[s].lock().unwrap());
                         kept.clear();
-                        kept.reserve(total);
-                        for piece in pieces {
-                            for raw in piece {
-                                match kept.entry(raw.event) {
-                                    Entry::Vacant(v) => {
-                                        v.insert(raw);
-                                    }
-                                    Entry::Occupied(mut o) => {
-                                        if raw.ingest < o.get().ingest {
-                                            o.insert(raw);
-                                        }
+                        kept.reserve(piece.len());
+                        for raw in piece {
+                            match kept.entry(raw.event) {
+                                Entry::Vacant(v) => {
+                                    v.insert(raw);
+                                }
+                                Entry::Occupied(mut o) => {
+                                    if raw.ingest < o.get().ingest {
+                                        o.insert(raw);
                                     }
                                 }
                             }
@@ -486,12 +505,19 @@ fn parse_click_shards(
     campaigns: &Campaigns,
 ) -> Result<Vec<Vec<Click>>, String> {
     let click_lo = window.start - WEEK_MS;
-    scan::for_chunks(
+    let bits = hash_bits(ncpu);
+    let shards = 1usize << bits;
+    let thread_parts = scan::for_chunks(
         files,
         ncpu,
-        Vec::new,
-        |out: &mut Vec<Click>, data, start, end| {
-            out.reserve((end - start) / 48);
+        || (0..shards).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
+        |out: &mut Vec<Vec<Click>>, data, start, end| {
+            let per = ((end - start) / 48 / shards).saturating_add(1);
+            for bucket in out.iter_mut() {
+                if bucket.capacity() < bucket.len() + per {
+                    bucket.reserve(per);
+                }
+            }
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 4];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() || fields[1].is_empty() {
@@ -508,21 +534,23 @@ fn parse_click_shards(
                 }
                 let cid = Id::of(fields[0]);
                 // `person` holds the raw user until dedup resolves the linked name.
-                out.push(Click {
+                let click = Click {
                     person: Id::of(fields[1]),
                     ts: (ts_abs - window.start) as i32,
                     campaign,
                     id: cid,
-                });
+                };
+                let s = click.id.shard(bits);
+                out[s].push(click);
             });
         },
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(merge_thread_shards(thread_parts, shards))
 }
 
 fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec<Click>> {
-    let bits = hash_bits(ncpu);
-    let columns = partition(parts, bits, |click| click.id.shard(bits));
+    let columns: Vec<Mutex<Vec<Click>>> = parts.into_iter().map(Mutex::new).collect();
     let next = AtomicUsize::new(0);
     let outs: Vec<Vec<Vec<Click>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..ncpu.max(1))
@@ -535,15 +563,12 @@ fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec
                         if s >= columns.len() {
                             break;
                         }
-                        let pieces = std::mem::take(&mut *columns[s].lock().unwrap());
-                        let total: usize = pieces.iter().map(|p| p.len()).sum();
+                        let piece = std::mem::take(&mut *columns[s].lock().unwrap());
                         kept.clear();
-                        kept.reserve(total);
-                        for piece in pieces {
-                            for click in piece {
-                                // Copies of one click_id are identical, so any survivor is fine.
-                                kept.entry(click.id).or_insert(click);
-                            }
+                        kept.reserve(piece.len());
+                        for click in piece {
+                            // Copies of one click_id are identical, so any survivor is fine.
+                            kept.entry(click.id).or_insert(click);
                         }
                         for mut click in kept.values().copied() {
                             click.person = people.name_of(click.person);
@@ -557,33 +582,6 @@ fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     merge_buckets(outs)
-}
-
-fn partition<T: Send>(parts: Vec<Vec<T>>, bits: u32, shard: impl Fn(&T) -> usize + Sync) -> Vec<Mutex<Vec<Vec<T>>>> {
-    let shards = 1usize << bits;
-    let columns: Vec<Mutex<Vec<Vec<T>>>> = (0..shards).map(|_| Mutex::new(Vec::new())).collect();
-    let split: Vec<Vec<Vec<T>>> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for part in parts {
-            handles.push(scope.spawn(|| {
-                let guess = part.len() / shards + 1;
-                let mut buckets: Vec<Vec<T>> = (0..shards).map(|_| Vec::with_capacity(guess)).collect();
-                for item in part {
-                    buckets[shard(&item)].push(item);
-                }
-                buckets
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    for buckets in split {
-        for (s, bucket) in buckets.into_iter().enumerate() {
-            if !bucket.is_empty() {
-                columns[s].lock().unwrap().push(bucket);
-            }
-        }
-    }
-    columns
 }
 
 fn merge_buckets<T>(outs: Vec<Vec<Vec<T>>>) -> Vec<Vec<T>> {
