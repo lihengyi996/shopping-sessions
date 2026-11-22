@@ -50,6 +50,24 @@ const CHARS: [u8; 64] = {
     out
 };
 
+/// ASCII → nibble; 0xFF = invalid. Speeds the v5 33-char hex hot path.
+const HEX_VAL: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    i = 0;
+    while i < 6 {
+        t[b'a' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t
+};
+
+const HEX_OUT: [u8; 16] = *b"0123456789abcdef";
+
 struct Pool {
     by_bytes: HashMap<Vec<u8>, u32>,
     bytes: Vec<Vec<u8>>,
@@ -96,7 +114,12 @@ impl Id {
     #[inline]
     pub fn of(raw: &[u8]) -> Self {
         if let Some(packed) = pack(raw) {
-            return Id { kind: KIND_PACK, prefix: 0, lo: packed, hi: 0 };
+            return Id {
+                kind: KIND_PACK,
+                prefix: 0,
+                lo: packed,
+                hi: 0,
+            };
         }
         if let Some((prefix, bits)) = pack_hex33(raw) {
             return Id {
@@ -112,13 +135,7 @@ impl Id {
     pub fn bytes(self) -> Vec<u8> {
         match self.kind {
             KIND_PACK => unpack(self.lo),
-            KIND_HEX => {
-                let bits = (u128::from(self.hi) << 64) | u128::from(self.lo);
-                let mut out = Vec::with_capacity(33);
-                out.push(self.prefix);
-                out.extend_from_slice(format!("{bits:032x}").as_bytes());
-                out
-            }
+            KIND_HEX => unpack_hex(self.prefix, self.lo, self.hi),
             _ => {
                 let s = (self.lo >> 32) as usize;
                 let idx = self.lo as u32 as usize;
@@ -188,15 +205,32 @@ fn pack_hex33(raw: &[u8]) -> Option<(u8, u128)> {
         return None;
     }
     let mut v = 0u128;
-    for &b in &raw[1..] {
-        let nibble = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            _ => return None,
-        };
-        v = (v << 4) | u128::from(nibble);
+    // Unrolled 4-at-a-time with a nibble LUT.
+    let hex = &raw[1..];
+    let mut i = 0;
+    while i < 32 {
+        let a = HEX_VAL[hex[i] as usize];
+        let b = HEX_VAL[hex[i + 1] as usize];
+        let c = HEX_VAL[hex[i + 2] as usize];
+        let d = HEX_VAL[hex[i + 3] as usize];
+        if a > 15 || b > 15 || c > 15 || d > 15 {
+            return None;
+        }
+        v = (v << 16) | u128::from((u16::from(a) << 12) | (u16::from(b) << 8) | (u16::from(c) << 4) | u16::from(d));
+        i += 4;
     }
     Some((prefix, v))
+}
+
+fn unpack_hex(prefix: u8, lo: u64, hi: u64) -> Vec<u8> {
+    let mut bits = (u128::from(hi) << 64) | u128::from(lo);
+    let mut out = vec![0u8; 33];
+    out[0] = prefix;
+    for i in (0..32).rev() {
+        out[1 + i] = HEX_OUT[(bits & 15) as usize];
+        bits >>= 4;
+    }
+    out
 }
 
 fn unpack(mut v: u64) -> Vec<u8> {

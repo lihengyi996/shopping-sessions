@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 
 use memmap2::{Mmap, MmapOptions};
 
-pub const CHUNK: usize = 2 << 20;
+pub const CHUNK: usize = 4 << 20;
 
 pub fn csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();

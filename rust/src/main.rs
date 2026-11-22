@@ -34,16 +34,18 @@ const PERSON_SHARDS: usize = 1 << PERSON_BITS;
 const PRICE_BITS: u32 = 24;
 const PRICE_MASK: u32 = (1 << PRICE_BITS) - 1;
 
+/// Relative ts sentinel: copy failed validation (still needed for ingest-min dedup).
+const INVALID_TS: i32 = i32::MIN;
+
 #[derive(Clone, Copy)]
 struct RawEvent {
     event: Id,
     ingest: i64,
     user: Id,
-    /// Milliseconds from window_start; only meaningful when `ok`.
+    /// Milliseconds from window_start; `INVALID_TS` when the copy is invalid.
     ts: i32,
-    /// 0 = not a purchase / invalid purchase marker handled via ok flag.
+    /// 0 = not a purchase. Price in low 24 bits, category in the high bits.
     sale: u32,
-    ok: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +262,7 @@ fn run() -> Result<(), String> {
         }
     }
 
+    let t_sess = t0.elapsed();
     out::write_campaign_daily(
         &camp_dir.join("part-000.parquet"),
         &total,
@@ -271,10 +274,11 @@ fn run() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     eprintln!(
-        "shopsess setup {:?} scan {:?} dedup {:?} total {:?}",
+        "shopsess setup {:?} scan {:?} dedup {:?} session {:?} total {:?}",
         t_setup,
         t_scan.saturating_sub(t_setup),
         t_dedup.saturating_sub(t_scan),
+        t_sess.saturating_sub(t_dedup),
         t0.elapsed()
     );
     Ok(())
@@ -337,16 +341,19 @@ fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Op
         _ => (false, false),
     };
     let mut ok = !user_raw.is_empty() && !product_raw.is_empty() && typed;
-    let ts = match ts::parse(fields[2]) {
-        Some(t) if t >= window.start && t < window.end => {
-            ok &= ingest.saturating_sub(t) <= DAY_MS;
-            (t - window.start) as i32
+    let mut ts = INVALID_TS;
+    if ok {
+        match ts::parse(fields[2]) {
+            Some(t) if t >= window.start && t < window.end => {
+                if ingest.saturating_sub(t) <= DAY_MS {
+                    ts = (t - window.start) as i32;
+                } else {
+                    ok = false;
+                }
+            }
+            _ => ok = false,
         }
-        _ => {
-            ok = false;
-            0
-        }
-    };
+    }
     let mut sale = 0u32;
     if purchase && ok {
         match parse_price(fields[6]) {
@@ -354,16 +361,18 @@ fn decode_event(fields: &[&[u8]; 7], window: &Window, products: &Products) -> Op
                 let cat = product_cat(products, product_raw);
                 sale = price | (u32::from(cat) << PRICE_BITS);
             }
-            None => ok = false,
+            None => {
+                ok = false;
+                ts = INVALID_TS;
+            }
         }
     }
     Some(RawEvent {
         event,
         ingest,
         user: if ok { Id::of(user_raw) } else { Id::of(b"") },
-        ts,
-        sale,
-        ok,
+        ts: if ok { ts } else { INVALID_TS },
+        sale: if ok { sale } else { 0 },
     })
 }
 
@@ -420,9 +429,9 @@ fn parse_price(raw: &[u8]) -> Option<u32> {
 }
 
 fn hash_bits(_ncpu: usize) -> u32 {
-    // 1024 shards keep each open table near L2. 64 was our prior best; 8 was
-    // much slower. Public fast entries also land near this partition count.
-    10
+    // 512 shards: public top entries sit here; 1024 was fine but denser tables
+    // cut open-address traffic, and 2048 regressed in A/B.
+    9
 }
 
 fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<Vec<Event>> {
@@ -459,7 +468,7 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
                             }
                         }
                         for raw in kept.values() {
-                            if !raw.ok {
+                            if raw.ts == INVALID_TS {
                                 continue;
                             }
                             let person = people.name_of(raw.user);
@@ -673,6 +682,10 @@ fn sessionize(
     let mut cat_rev = [0i64; MAX_D * MAX_C];
     let mut used = [false; MAX_D];
     sessions.clear();
+    let week = WEEK_MS as i32;
+    // Sessions and clicks are both ts-ordered; advance click windows in one pass.
+    let mut hi = 0usize; // first click with ts > start
+    let mut lo = 0usize; // first click still inside the 7-day lookback
 
     let mut k = 0;
     while k < events.len() {
@@ -702,7 +715,24 @@ fn sessionize(
         day_events[day] += n;
         day_revenue[day] += revenue;
 
-        let credited = credit_campaign(clicks, start);
+        while hi < clicks.len() && clicks[hi].ts <= start {
+            hi += 1;
+        }
+        let low_bound = start - week;
+        while lo < hi && clicks[lo].ts < low_bound {
+            lo += 1;
+        }
+        // Latest eligible click ts is clicks[hi-1]; earliest same-ts wins (sorted by id).
+        let credited = if hi > lo {
+            let t = clicks[hi - 1].ts;
+            let mut b = hi - 1;
+            while b > lo && clicks[b - 1].ts == t {
+                b -= 1;
+            }
+            clicks[b].campaign
+        } else {
+            0
+        };
         let cell = &mut cells[credited as usize * days + day];
         cell.sessions += 1;
         if revenue > 0 {
@@ -767,6 +797,9 @@ fn sessionize_heap(
     let mut cat_rev = vec![0i64; days * nc];
     let mut used = vec![false; days];
     sessions.clear();
+    let week = WEEK_MS as i32;
+    let mut hi = 0usize;
+    let mut lo = 0usize;
     let mut k = 0;
     while k < events.len() {
         let start = events[k].ts;
@@ -794,7 +827,23 @@ fn sessionize_heap(
         day_sessions[day] += 1;
         day_events[day] += n;
         day_revenue[day] += revenue;
-        let credited = credit_campaign(clicks, start);
+        while hi < clicks.len() && clicks[hi].ts <= start {
+            hi += 1;
+        }
+        let low_bound = start - week;
+        while lo < hi && clicks[lo].ts < low_bound {
+            lo += 1;
+        }
+        let credited = if hi > lo {
+            let t = clicks[hi - 1].ts;
+            let mut b = hi - 1;
+            while b > lo && clicks[b - 1].ts == t {
+                b -= 1;
+            }
+            clicks[b].campaign
+        } else {
+            0
+        };
         let cell = &mut cells[credited as usize * days + day];
         cell.sessions += 1;
         if revenue > 0 {
@@ -836,22 +885,6 @@ fn sessionize_heap(
             top: top.map(|c| c as u16),
         });
     }
-}
-
-fn credit_campaign(clicks: &[Click], start: i32) -> u16 {
-    // Latest click with ts <= start and start - ts <= WEEK; ties -> smallest id
-    // (clicks already sorted by ts then id). Index 0 is always `organic`.
-    let week = WEEK_MS as i32;
-    let i = clicks.partition_point(|c| c.ts <= start);
-    if i == 0 {
-        return 0;
-    }
-    let t = clicks[i - 1].ts;
-    if start - t > week {
-        return 0;
-    }
-    let j = clicks.partition_point(|c| c.ts < t);
-    clicks[j].campaign
 }
 
 fn assist(clicks: &[Click], sessions: &[(i32, usize)], days: usize, cells: &mut [CampCell]) {
