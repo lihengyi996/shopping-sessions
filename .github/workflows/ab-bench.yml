@@ -56,6 +56,7 @@ jobs:
           DATA_DIR: /tmp/ss-ab-data
           OUTPUT_DIR: /tmp/ss-ab-out
         run: |
+          set -o pipefail
           chmod +x scripts/ab_bench.sh
           scripts/ab_bench.sh | tee ab-bench.log
 
