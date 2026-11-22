@@ -13,7 +13,7 @@ hashbrown = "0.15"
 memchr = "2"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
-parquet = { version = "54", default-features = false, features = ["snap"] }
+parquet = { version = "54", default-features = false }
 
 [profile.release]
 opt-level = 3

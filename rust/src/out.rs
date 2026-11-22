@@ -1,6 +1,5 @@
-//! Write the two Parquet tables the scorer reads.
-//! Snappy + INT32 count columns keep the on-disk payload small so the container
-//! exit flush (bind-mounted /output) costs less wall time.
+//! Write the two Parquet tables the scorer reads. Uncompressed PLAIN columns
+//! keep encode time tiny; row order does not matter.
 
 use std::fs::File;
 use std::path::Path;
@@ -19,8 +18,8 @@ type Fail = Box<dyn std::error::Error + Send + Sync>;
 const USER_SCHEMA: &str = "message user_daily {
     required binary user_id (UTF8);
     required int32 day (DATE);
-    required int32 sessions;
-    required int32 events;
+    required int64 sessions;
+    required int64 events;
     required int64 revenue_cents;
     optional binary top_category (UTF8);
 }";
@@ -29,10 +28,10 @@ const CAMP_SCHEMA: &str = "message campaign_daily {
     required binary campaign_id (UTF8);
     required binary channel (UTF8);
     required int32 day (DATE);
-    required int32 sessions;
-    required int32 purchasing_sessions;
+    required int64 sessions;
+    required int64 purchasing_sessions;
     required int64 revenue_cents;
-    required int32 assisted_sessions;
+    required int64 assisted_sessions;
 }";
 
 pub struct UserRow {
@@ -57,7 +56,7 @@ fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>, Fail>
     let schema = Arc::new(parse_message_type(schema)?);
     let props = Arc::new(
         WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
             .set_encoding(Encoding::PLAIN)
@@ -78,12 +77,11 @@ pub fn write_user_daily(path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -
     for pick in [
         (|r: &UserRow| r.sessions) as fn(&UserRow) -> i64,
         |r| r.events,
+        |r| r.revenue,
     ] {
-        let values: Vec<i32> = rows.iter().map(|r| i32::try_from(pick(r)).unwrap_or(i32::MAX)).collect();
-        write_i32(&mut group, &values)?;
+        let values: Vec<i64> = rows.iter().map(pick).collect();
+        write_i64(&mut group, &values)?;
     }
-    let revenue: Vec<i64> = rows.iter().map(|r| r.revenue).collect();
-    write_i64(&mut group, &revenue)?;
     let levels: Vec<i16> = rows.iter().map(|r| i16::from(r.top.is_some())).collect();
     let tops: Vec<ByteArray> = rows
         .iter()
@@ -108,10 +106,7 @@ pub fn write_campaign_daily(
     let mut ids = Vec::new();
     let mut chans = Vec::new();
     let mut day_col = Vec::new();
-    let mut sessions = Vec::new();
-    let mut purchasing = Vec::new();
-    let mut revenue = Vec::new();
-    let mut assisted = Vec::new();
+    let mut cols: [Vec<i64>; 4] = Default::default();
     for (c, id) in campaign_ids.iter().enumerate() {
         for d in 0..days {
             let cell = cells[c * days + d];
@@ -121,11 +116,11 @@ pub fn write_campaign_daily(
             ids.push(ByteArray::from(id.clone()));
             chans.push(ByteArray::from(channels[c].clone()));
             day_col.push(base_day + d as i32);
-            sessions.push(i32::try_from(cell.sessions).unwrap_or(i32::MAX));
-            purchasing.push(i32::try_from(cell.purchasing).unwrap_or(i32::MAX));
-            revenue.push(cell.revenue);
-            let a = if c == organic_idx { 0 } else { cell.assisted };
-            assisted.push(i32::try_from(a).unwrap_or(i32::MAX));
+            cols[0].push(cell.sessions);
+            cols[1].push(cell.purchasing);
+            cols[2].push(cell.revenue);
+            let assisted = if c == organic_idx { 0 } else { cell.assisted };
+            cols[3].push(assisted);
         }
     }
     let mut file = writer(path, CAMP_SCHEMA)?;
@@ -133,10 +128,9 @@ pub fn write_campaign_daily(
     write_bytes(&mut group, &ids, None)?;
     write_bytes(&mut group, &chans, None)?;
     write_i32(&mut group, &day_col)?;
-    write_i32(&mut group, &sessions)?;
-    write_i32(&mut group, &purchasing)?;
-    write_i64(&mut group, &revenue)?;
-    write_i32(&mut group, &assisted)?;
+    for values in &cols {
+        write_i64(&mut group, values)?;
+    }
     group.close()?;
     file.close()?;
     Ok(())
