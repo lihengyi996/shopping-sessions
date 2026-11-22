@@ -8,18 +8,17 @@ pub const WEEK_MS: i64 = 7 * DAY_MS;
 
 #[inline]
 pub fn parse(raw: &[u8]) -> Option<i64> {
+    // Generator and fixtures are dominated by F1 (`...Z`). Keep that path tiny.
     if raw.len() == 20 && raw[19] == b'Z' && raw[10] == b'T' {
-        let (y, m, d, h, mi, s) = clock(&raw[..19])?;
-        return Some(epoch_ms(y, m, d, h, mi, s));
+        return parse_civil(&raw[..19]);
     }
     if raw.len() == 25 && raw[10] == b'T' && (raw[19] == b'+' || raw[19] == b'-') && raw[22] == b':' {
-        let (y, m, d, h, mi, s) = clock(&raw[..19])?;
-        let oh = two(&raw[20..22])?;
-        let om = two(&raw[23..25])?;
+        let local = parse_civil(&raw[..19])?;
+        let oh = dig2(raw, 20)?;
+        let om = dig2(raw, 23)?;
         if oh > 23 || om > 59 {
             return None;
         }
-        let local = epoch_ms(y, m, d, h, mi, s);
         let off = oh as i64 * HOUR_MS + om as i64 * MIN_MS;
         return Some(if raw[19] == b'+' { local - off } else { local + off });
     }
@@ -29,7 +28,8 @@ pub fn parse(raw: &[u8]) -> Option<i64> {
     None
 }
 
-fn clock(raw: &[u8]) -> Option<(i32, i32, i32, i32, i32, i32)> {
+#[inline]
+fn parse_civil(raw: &[u8]) -> Option<i64> {
     if raw.len() != 19
         || raw[4] != b'-'
         || raw[7] != b'-'
@@ -39,16 +39,16 @@ fn clock(raw: &[u8]) -> Option<(i32, i32, i32, i32, i32, i32)> {
     {
         return None;
     }
-    let y = four(&raw[0..4])?;
-    let m = two(&raw[5..7])?;
-    let d = two(&raw[8..10])?;
-    let h = two(&raw[11..13])?;
-    let mi = two(&raw[14..16])?;
-    let s = two(&raw[17..19])?;
+    let y = dig4(raw, 0)?;
+    let m = dig2(raw, 5)?;
+    let d = dig2(raw, 8)?;
+    let h = dig2(raw, 11)?;
+    let mi = dig2(raw, 14)?;
+    let s = dig2(raw, 17)?;
     if h > 23 || mi > 59 || s > 59 || !ymd_ok(y, m, d) {
         return None;
     }
-    Some((y, m, d, h, mi, s))
+    Some(epoch_ms(y, m, d, h, mi, s))
 }
 
 fn ymd_ok(y: i32, m: i32, d: i32) -> bool {
@@ -66,19 +66,27 @@ fn ymd_ok(y: i32, m: i32, d: i32) -> bool {
     d <= days
 }
 
-fn two(raw: &[u8]) -> Option<i32> {
-    if raw.len() == 2 && raw[0].is_ascii_digit() && raw[1].is_ascii_digit() {
-        Some((raw[0] - b'0') as i32 * 10 + (raw[1] - b'0') as i32)
-    } else {
+#[inline(always)]
+fn dig2(raw: &[u8], i: usize) -> Option<i32> {
+    let a = raw[i].wrapping_sub(b'0');
+    let b = raw[i + 1].wrapping_sub(b'0');
+    if a > 9 || b > 9 {
         None
+    } else {
+        Some(a as i32 * 10 + b as i32)
     }
 }
 
-fn four(raw: &[u8]) -> Option<i32> {
-    if raw.len() == 4 && raw.iter().all(|b| b.is_ascii_digit()) {
-        Some(raw.iter().fold(0, |n, b| n * 10 + (b - b'0') as i32))
-    } else {
+#[inline(always)]
+fn dig4(raw: &[u8], i: usize) -> Option<i32> {
+    let a = raw[i].wrapping_sub(b'0');
+    let b = raw[i + 1].wrapping_sub(b'0');
+    let c = raw[i + 2].wrapping_sub(b'0');
+    let d = raw[i + 3].wrapping_sub(b'0');
+    if a > 9 || b > 9 || c > 9 || d > 9 {
         None
+    } else {
+        Some(a as i32 * 1000 + b as i32 * 100 + c as i32 * 10 + d as i32)
     }
 }
 
@@ -101,6 +109,7 @@ fn digits(raw: &[u8]) -> Option<i64> {
     Some(n)
 }
 
+#[inline]
 pub fn epoch_ms(y: i32, m: i32, d: i32, h: i32, mi: i32, s: i32) -> i64 {
     days_from_civil(y, m, d) * DAY_MS + h as i64 * HOUR_MS + mi as i64 * MIN_MS + s as i64 * 1000
 }

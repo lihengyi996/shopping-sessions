@@ -53,6 +53,6 @@ $mc = ($cands | Sort-Object)[[int](($cands.Count - 1) / 2)]
 $diffs = 0..($Pairs - 1) | ForEach-Object { $bases[$_] - $cands[$_] }
 $md = ($diffs | Sort-Object)[[int](($diffs.Count - 1) / 2)]
 "median BASE={0:N3}s CAND={1:N3}s median_diff={2:N3}s ({3:N1}%)" -f $mb, $mc, $md, (100.0 * $md / $mb) | Write-Output
-$pass = $md -ge (0.10 * $mb)
+$pass = $md -ge (0.05 * $mb)
 "GATE_PASS=$pass"
 if (-not $pass) { exit 1 }

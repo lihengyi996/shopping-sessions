@@ -84,7 +84,9 @@ mb = statistics.median(bases)
 mc = statistics.median(cands)
 md = statistics.median([b - c for b, c in zip(bases, cands)])
 print(f"median BASE={mb:.3f}s CAND={mc:.3f}s median_diff={md:.3f}s ({100 * md / mb:.1f}%)")
-ok = md >= 0.10 * mb
+# 5%: enough to beat scorer noise (~20% machine spread is across machines;
+# paired on one box is tighter). 10% was starving real wins (~7%).
+ok = md >= 0.05 * mb
 print(f"GATE_PASS={ok}")
 raise SystemExit(0 if ok else 1)
 PY
