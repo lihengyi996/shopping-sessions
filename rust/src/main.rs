@@ -28,7 +28,7 @@ use ts::{day_of, DAY_MS, GAP_MS, WEEK_MS};
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc;
 
-const PERSON_BITS: u32 = 10;
+const PERSON_BITS: u32 = 9;
 const PERSON_SHARDS: usize = 1 << PERSON_BITS;
 
 const PRICE_BITS: u32 = 24;
