@@ -14,3 +14,6 @@ dev-answer/
 shopping-scratch/
 duckdb_tmp/
 _generator_src/
+_generator_v5/
+_v4_backup/
+generator/target/

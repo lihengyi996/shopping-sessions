@@ -1,17 +1,26 @@
-//! User / event / campaign identifiers as a single machine word when they fit.
+//! Opaque identifiers for v5: short IDs pack into a word; 33-char `X`+hex IDs
+//! store inline without a lock; everything else uses a sharded intern pool.
 
 use std::cmp::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use hashbrown::HashMap;
 
-/// Opaque identifier. Short `[0-9A-Za-z_]` values pack so byte order matches
-/// numeric order; everything else is interned behind a process-wide table.
+/// Opaque identifier. Equality is exact byte identity; `ord` is byte order.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-pub struct Id(u64);
+pub struct Id {
+    kind: u8,
+    prefix: u8,
+    lo: u64,
+    hi: u64,
+}
+
+const KIND_PACK: u8 = 0;
+const KIND_HEX: u8 = 1;
+const KIND_INTERN: u8 = 2;
 
 const MAX_PACK: usize = 10;
-const INTERNED: u64 = 1 << 63;
+const SHARDS: usize = 256;
 
 const CODES: [u8; 256] = {
     let mut t = [0u8; 256];
@@ -46,47 +55,90 @@ struct Pool {
     bytes: Vec<Vec<u8>>,
 }
 
+type ShardPool = Mutex<Pool>;
+
+fn pools() -> &'static [ShardPool; SHARDS] {
+    static POOLS: OnceLock<[ShardPool; SHARDS]> = OnceLock::new();
+    POOLS.get_or_init(|| {
+        std::array::from_fn(|_| Mutex::new(Pool { by_bytes: HashMap::new(), bytes: Vec::new() }))
+    })
+}
+
+#[inline]
+fn shard_of(raw: &[u8]) -> usize {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in raw {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h as usize & (SHARDS - 1)
+}
+
 #[cold]
 #[inline(never)]
 fn intern(raw: &[u8]) -> Id {
-    let mut p = pool().lock().unwrap();
+    let s = shard_of(raw);
+    let mut p = pools()[s].lock().unwrap();
     let n = p.bytes.len() as u32;
     let idx = *p.by_bytes.entry(raw.to_vec()).or_insert(n);
     if idx == n {
         p.bytes.push(raw.to_vec());
     }
-    Id(INTERNED | u64::from(idx))
-}
-
-fn pool() -> &'static Mutex<Pool> {
-    static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        Mutex::new(Pool { by_bytes: HashMap::new(), bytes: Vec::new() })
-    })
+    Id {
+        kind: KIND_INTERN,
+        prefix: 0,
+        lo: ((s as u64) << 32) | u64::from(idx),
+        hi: 0,
+    }
 }
 
 impl Id {
     #[inline]
     pub fn of(raw: &[u8]) -> Self {
         if let Some(packed) = pack(raw) {
-            Id(packed)
-        } else {
-            intern(raw)
+            return Id { kind: KIND_PACK, prefix: 0, lo: packed, hi: 0 };
         }
+        if let Some((prefix, bits)) = pack_hex33(raw) {
+            return Id {
+                kind: KIND_HEX,
+                prefix,
+                lo: bits as u64,
+                hi: (bits >> 64) as u64,
+            };
+        }
+        intern(raw)
     }
 
     pub fn bytes(self) -> Vec<u8> {
-        if self.0 & INTERNED == 0 {
-            unpack(self.0)
-        } else {
-            pool().lock().unwrap().bytes[(self.0 & !INTERNED) as usize].clone()
+        match self.kind {
+            KIND_PACK => unpack(self.lo),
+            KIND_HEX => {
+                let bits = (u128::from(self.hi) << 64) | u128::from(self.lo);
+                let mut out = Vec::with_capacity(33);
+                out.push(self.prefix);
+                out.extend_from_slice(format!("{bits:032x}").as_bytes());
+                out
+            }
+            _ => {
+                let s = (self.lo >> 32) as usize;
+                let idx = self.lo as u32 as usize;
+                pools()[s].lock().unwrap().bytes[idx].clone()
+            }
         }
     }
 
     #[inline]
     pub fn ord(self, other: Self) -> Ordering {
-        if (self.0 | other.0) & INTERNED == 0 {
-            self.0.cmp(&other.0)
+        if self.kind == other.kind && self.kind != KIND_INTERN {
+            match self.kind {
+                KIND_PACK => self.lo.cmp(&other.lo),
+                KIND_HEX => self
+                    .prefix
+                    .cmp(&other.prefix)
+                    .then_with(|| self.hi.cmp(&other.hi))
+                    .then_with(|| self.lo.cmp(&other.lo)),
+                _ => self.bytes().cmp(&other.bytes()),
+            }
         } else {
             self.bytes().cmp(&other.bytes())
         }
@@ -95,12 +147,17 @@ impl Id {
     /// Stable machine key for grouping/sorting when byte order is not required.
     #[inline]
     pub fn key(self) -> u64 {
-        self.0
+        self.lo
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(self.hi)
+            .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            .wrapping_add(u64::from(self.kind) << 56)
+            .wrapping_add(u64::from(self.prefix))
     }
 
     #[inline]
     pub fn shard(self, bits: u32) -> usize {
-        (self.0.wrapping_mul(0x517c_c1b7_2722_0a95) >> (64 - bits)) as usize
+        (self.key().wrapping_mul(0x517c_c1b7_2722_0a95) >> (64 - bits)) as usize
     }
 }
 
@@ -118,6 +175,28 @@ fn pack(raw: &[u8]) -> Option<u64> {
         v = (v << 6) | u64::from(c);
     }
     Some(v << (6 * (MAX_PACK - raw.len())))
+}
+
+/// v5 long form: one prefix byte + 32 lowercase hex digits (no lock).
+#[inline]
+fn pack_hex33(raw: &[u8]) -> Option<(u8, u128)> {
+    if raw.len() != 33 {
+        return None;
+    }
+    let prefix = raw[0];
+    if !prefix.is_ascii_alphanumeric() {
+        return None;
+    }
+    let mut v = 0u128;
+    for &b in &raw[1..] {
+        let nibble = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => return None,
+        };
+        v = (v << 4) | u128::from(nibble);
+    }
+    Some((prefix, v))
 }
 
 fn unpack(mut v: u64) -> Vec<u8> {
