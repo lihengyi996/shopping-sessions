@@ -310,7 +310,6 @@ fn parse_events(
         ncpu,
         Vec::new,
         |out: &mut Vec<RawEvent>, data, start, end| {
-            out.reserve((end - start) / 64);
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 7];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() {
@@ -434,8 +433,7 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
             .map(|_| {
                 scope.spawn(|| {
                     let mut open: Vec<Vec<Event>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-                    // Pieces stay put; the map only stores ingest + (piece, row).
-                    let mut kept: HashMap<Id, (i64, u16, u32)> = HashMap::new();
+                    let mut kept: HashMap<Id, RawEvent> = HashMap::new();
                     loop {
                         let s = next.fetch_add(1, AtomicOrdering::Relaxed);
                         if s >= columns.len() {
@@ -445,23 +443,21 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
                         let total: usize = pieces.iter().map(|p| p.len()).sum();
                         kept.clear();
                         kept.reserve(total);
-                        for (pi, piece) in pieces.iter().enumerate() {
-                            let pi = pi as u16;
-                            for (ri, raw) in piece.iter().enumerate() {
+                        for piece in pieces {
+                            for raw in piece {
                                 match kept.entry(raw.event) {
                                     Entry::Vacant(v) => {
-                                        v.insert((raw.ingest, pi, ri as u32));
+                                        v.insert(raw);
                                     }
                                     Entry::Occupied(mut o) => {
-                                        if raw.ingest < o.get().0 {
-                                            o.insert((raw.ingest, pi, ri as u32));
+                                        if raw.ingest < o.get().ingest {
+                                            o.insert(raw);
                                         }
                                     }
                                 }
                             }
                         }
-                        for &(_, pi, ri) in kept.values() {
-                            let raw = &pieces[pi as usize][ri as usize];
+                        for raw in kept.values() {
                             if !raw.ok {
                                 continue;
                             }
@@ -494,7 +490,6 @@ fn parse_click_shards(
         ncpu,
         Vec::new,
         |out: &mut Vec<Click>, data, start, end| {
-            out.reserve((end - start) / 48);
             csv::for_body_lines(data, start, end, |line| {
                 let mut fields = [b"" as &[u8]; 4];
                 if !csv::split(line, &mut fields) || fields[0].is_empty() || fields[1].is_empty() {
@@ -532,7 +527,7 @@ fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec
             .map(|_| {
                 scope.spawn(|| {
                     let mut open: Vec<Vec<Click>> = (0..PERSON_SHARDS).map(|_| Vec::new()).collect();
-                    let mut kept: HashMap<Id, (u16, u32)> = HashMap::new();
+                    let mut kept: HashMap<Id, Click> = HashMap::new();
                     loop {
                         let s = next.fetch_add(1, AtomicOrdering::Relaxed);
                         if s >= columns.len() {
@@ -542,15 +537,13 @@ fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec
                         let total: usize = pieces.iter().map(|p| p.len()).sum();
                         kept.clear();
                         kept.reserve(total);
-                        for (pi, piece) in pieces.iter().enumerate() {
-                            let pi = pi as u16;
-                            for (ri, click) in piece.iter().enumerate() {
+                        for piece in pieces {
+                            for click in piece {
                                 // Copies of one click_id are identical, so any survivor is fine.
-                                kept.entry(click.id).or_insert((pi, ri as u32));
+                                kept.entry(click.id).or_insert(click);
                             }
                         }
-                        for &(pi, ri) in kept.values() {
-                            let mut click = pieces[pi as usize][ri as usize];
+                        for mut click in kept.values().copied() {
                             click.person = people.name_of(click.person);
                             open[click.person.shard(PERSON_BITS)].push(click);
                         }
