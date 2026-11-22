@@ -420,9 +420,8 @@ fn parse_price(raw: &[u8]) -> Option<u32> {
 }
 
 fn hash_bits(_ncpu: usize) -> u32 {
-    // 1024 shards keep each open table near L2. 64 was our prior best; 8 was
-    // much slower. Public fast entries also land near this partition count.
-    10
+    // 2048 shards: try finer dedup partitions on v5 unique-id load.
+    11
 }
 
 fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<Vec<Event>> {
