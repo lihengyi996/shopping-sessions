@@ -9,7 +9,8 @@ use std::sync::{Mutex, OnceLock};
 
 use memmap2::{Mmap, MmapOptions};
 
-pub const CHUNK: usize = 2 << 20;
+// 8 MiB chunks cut atomic task claims vs 2 MiB without blowing the 24 GB arena.
+pub const CHUNK: usize = 8 << 20;
 
 pub fn csv_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();

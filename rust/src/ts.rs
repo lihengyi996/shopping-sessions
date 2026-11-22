@@ -1,10 +1,17 @@
 //! Timestamp parsing for F1 / F2 / F3 forms in rules.md.
 
+use std::cell::Cell;
+
 pub const DAY_MS: i64 = 86_400_000;
 pub const HOUR_MS: i64 = 3_600_000;
 pub const MIN_MS: i64 = 60_000;
 pub const GAP_MS: i64 = 1_800_000;
 pub const WEEK_MS: i64 = 7 * DAY_MS;
+
+// Nearby rows usually share a calendar day. Cache civil→day-number per thread.
+thread_local! {
+    static DAY_CACHE: Cell<(i32, i32, i32, i64)> = const { Cell::new((0, 0, 0, 0)) };
+}
 
 #[inline]
 pub fn parse(raw: &[u8]) -> Option<i64> {
@@ -48,7 +55,17 @@ fn parse_civil(raw: &[u8]) -> Option<i64> {
     if h > 23 || mi > 59 || s > 59 || !ymd_ok(y, m, d) {
         return None;
     }
-    Some(epoch_ms(y, m, d, h, mi, s))
+    let days = DAY_CACHE.with(|cache| {
+        let (cy, cm, cd, cdays) = cache.get();
+        if cy == y && cm == m && cd == d {
+            cdays
+        } else {
+            let days = days_from_civil(y, m, d);
+            cache.set((y, m, d, days));
+            days
+        }
+    });
+    Some(ms_of_day(days, h, mi, s))
 }
 
 fn ymd_ok(y: i32, m: i32, d: i32) -> bool {
@@ -110,8 +127,13 @@ fn digits(raw: &[u8]) -> Option<i64> {
 }
 
 #[inline]
+fn ms_of_day(days: i64, h: i32, mi: i32, s: i32) -> i64 {
+    days * DAY_MS + h as i64 * HOUR_MS + mi as i64 * MIN_MS + s as i64 * 1000
+}
+
+#[inline]
 pub fn epoch_ms(y: i32, m: i32, d: i32, h: i32, mi: i32, s: i32) -> i64 {
-    days_from_civil(y, m, d) * DAY_MS + h as i64 * HOUR_MS + mi as i64 * MIN_MS + s as i64 * 1000
+    ms_of_day(days_from_civil(y, m, d), h, mi, s)
 }
 
 pub fn days_from_civil(y: i32, m: i32, d: i32) -> i64 {

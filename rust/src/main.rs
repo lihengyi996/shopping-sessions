@@ -458,6 +458,13 @@ fn dedup_events(parts: Vec<Vec<RawEvent>>, ncpu: usize, people: &People) -> Vec<
                                 }
                             }
                         }
+                        let ok_n = kept.values().filter(|r| r.ok).count();
+                        let per = (ok_n / PERSON_SHARDS).saturating_add(1);
+                        for bucket in &mut open {
+                            if bucket.capacity() < bucket.len() + per {
+                                bucket.reserve(per);
+                            }
+                        }
                         for raw in kept.values() {
                             if !raw.ok {
                                 continue;
@@ -543,6 +550,12 @@ fn dedup_clicks(parts: Vec<Vec<Click>>, ncpu: usize, people: &People) -> Vec<Vec
                             for click in piece {
                                 // Copies of one click_id are identical, so any survivor is fine.
                                 kept.entry(click.id).or_insert(click);
+                            }
+                        }
+                        let per = (kept.len() / PERSON_SHARDS).saturating_add(1);
+                        for bucket in &mut open {
+                            if bucket.capacity() < bucket.len() + per {
+                                bucket.reserve(per);
                             }
                         }
                         for mut click in kept.values().copied() {

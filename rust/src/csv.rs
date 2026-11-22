@@ -4,6 +4,11 @@ use memchr::{memchr, memchr2};
 
 #[inline]
 pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
+    // Generator rows are almost never quoted. One quote scan lets us take the
+    // plain comma path and skip per-field quote checks.
+    if memchr(b'"', line).is_none() {
+        return split_plain(line, out);
+    }
     let mut i = 0usize;
     for slot in 0..N {
         let Some((field, next)) = field(line, i) else {
@@ -17,6 +22,29 @@ pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> boo
             return false;
         }
         i = next + 1;
+    }
+    false
+}
+
+#[inline]
+fn split_plain<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
+    let mut start = 0usize;
+    for slot in 0..N {
+        if slot + 1 == N {
+            // Exact column count: a comma in the last field means too many columns.
+            if memchr(b',', &line[start..]).is_some() {
+                return false;
+            }
+            out[slot] = &line[start..];
+            return true;
+        }
+        match memchr(b',', &line[start..]) {
+            Some(rel) => {
+                out[slot] = &line[start..start + rel];
+                start += rel + 1;
+            }
+            None => return false,
+        }
     }
     false
 }
