@@ -36,23 +36,6 @@ struct Mapped {
     map: OnceLock<io::Result<Mmap>>,
 }
 
-fn map_file(path: &Path) -> io::Result<Mmap> {
-    let file = File::open(path)?;
-    let map = unsafe { MmapOptions::new().map(&file)? };
-    // Warm pages / prefer huge pages on Linux scorers.
-    #[cfg(unix)]
-    {
-        use memmap2::Advice;
-        let _ = map.advise(Advice::Sequential);
-        let _ = map.advise(Advice::WillNeed);
-        #[cfg(target_os = "linux")]
-        {
-            let _ = map.advise(Advice::HugePage);
-        }
-    }
-    Ok(map)
-}
-
 pub fn for_chunks<S, I, F>(paths: &[PathBuf], threads: usize, init: I, work: F) -> io::Result<Vec<S>>
 where
     S: Send,
@@ -87,7 +70,9 @@ where
                             break;
                         };
                         let file = &files[fi];
-                        match file.map.get_or_init(|| map_file(&file.path)) {
+                        match file.map.get_or_init(|| {
+                            File::open(&file.path).and_then(|f| unsafe { MmapOptions::new().map(&f) })
+                        }) {
                             Ok(map) if map.len() == file.len => work(&mut state, map, start, end),
                             Ok(map) => {
                                 let msg = format!(
